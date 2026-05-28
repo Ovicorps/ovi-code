@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
-#include <set>
 #include <sstream>
 #include <system_error>
 #include <unordered_set>
@@ -20,6 +19,68 @@ bool emit(const TranscriptSink& sink, TranscriptEntry::Kind kind,
           std::string title, std::string body) {
     if (!sink) return true;
     return sink({kind, std::move(title), std::move(body)});
+}
+
+// Produce a short human-readable description of a tool invocation that we
+// can show in the transcript. The full JSON args still go to the LLM via the
+// assistant message; this string is just for the user.
+std::string humanizeToolCall(const ToolCall& tc) {
+    auto get = [&](const char* k) -> std::string {
+        if (tc.input.contains(k) && tc.input[k].is_string())
+            return tc.input[k].get<std::string>();
+        return {};
+    };
+    if (tc.name == "read_file") {
+        auto p = get("path");
+        return p.empty() ? "read file" : "Reading " + p;
+    }
+    if (tc.name == "list_files") {
+        auto p = get("path");
+        return "Listing " + (p.empty() ? std::string(".") : p);
+    }
+    if (tc.name == "edit_file") {
+        auto p = get("path");
+        return p.empty() ? "edit file" : "Editing " + p;
+    }
+    return tc.name + " " + tc.input.dump();
+}
+
+// Format a tool's result for the transcript. Edit diffs are passed through
+// verbatim (the renderer colorizes `+`/`-` lines); read/list results are
+// trimmed to a short preview so the panel doesn't get drowned by file dumps.
+std::string humanizeToolResult(const ToolCall& tc, const ToolResult& r) {
+    if (r.is_error) return r.content;
+    if (tc.name == "edit_file") return r.content;  // already a diff
+
+    auto truncated = [](const std::string& s, size_t lines_cap,
+                        size_t bytes_cap) -> std::string {
+        if (s.size() <= bytes_cap) {
+            size_t newlines = 0;
+            for (char c : s) if (c == '\n') ++newlines;
+            if (newlines <= lines_cap) return s;
+        }
+        std::string out;
+        size_t lines = 0;
+        for (size_t i = 0; i < s.size() && i < bytes_cap; ++i) {
+            out.push_back(s[i]);
+            if (s[i] == '\n' && ++lines >= lines_cap) break;
+        }
+        out += "... (truncated, " + std::to_string(s.size()) + " bytes total)";
+        return out;
+    };
+
+    if (tc.name == "read_file") {
+        size_t lines = 0;
+        for (char c : r.content) if (c == '\n') ++lines;
+        std::string header =
+            "(" + std::to_string(r.content.size()) + " bytes, " +
+            std::to_string(lines) + " lines)\n";
+        return header + truncated(r.content, 20, 2000);
+    }
+    if (tc.name == "list_files") {
+        return truncated(r.content, 40, 4000);
+    }
+    return truncated(r.content, 20, 2000);
 }
 
 std::vector<std::string> keywords(const std::string& s) {
@@ -144,10 +205,8 @@ bool runReactLoop(const AgentContext& ctx, std::vector<Message>& messages,
         if (resp.tool_calls.empty()) return true;
 
         for (const auto& tc : resp.tool_calls) {
-            std::ostringstream titlebuf;
-            titlebuf << tc.name << "(" << tc.input.dump() << ")";
-            if (!emit(sink, TranscriptEntry::Kind::ToolCall, "tool",
-                      titlebuf.str()))
+            if (!emit(sink, TranscriptEntry::Kind::ToolCall, tc.name,
+                      humanizeToolCall(tc)))
                 return false;
             auto result = executeTool(ctx.workspace, tc);
             Message m;
@@ -159,10 +218,8 @@ bool runReactLoop(const AgentContext& ctx, std::vector<Message>& messages,
             messages.push_back(m);
             auto kind = result.is_error ? TranscriptEntry::Kind::Error
                                         : TranscriptEntry::Kind::ToolResult;
-            std::string preview = result.content;
-            if (preview.size() > 4000)
-                preview = preview.substr(0, 4000) + "\n...[truncated]";
-            if (!emit(sink, kind, tc.name, preview)) return false;
+            if (!emit(sink, kind, tc.name, humanizeToolResult(tc, result)))
+                return false;
         }
     }
     emit(sink, TranscriptEntry::Kind::Error, "Tool loop",

@@ -1,8 +1,9 @@
 #include "ovicode/tui.hpp"
 
+#include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <memory>
+#include <cctype>
+#include <cstdlib>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -175,19 +176,6 @@ Element banner(const Palette& pal, const std::string& title) {
         text("┌─ ovi-code ─ " + title + " " +
              std::string(40, '-')) |
             color(pal.accent),
-    });
-}
-
-Element splashLogo(const Palette& pal) {
-    return vbox({
-        text("    ██████╗ ██╗   ██╗██╗       ██████╗ ██████╗ ██████╗ ███████╗") | color(pal.logo),
-        text("   ██╔═══██╗██║   ██║██║      ██╔════╝██╔═══██╗██╔══██╗██╔════╝") | color(pal.logo),
-        text("   ██║   ██║██║   ██║██║█████╗██║     ██║   ██║██║  ██║█████╗  ") | color(pal.logo),
-        text("   ██║   ██║╚██╗ ██╔╝██║╚════╝██║     ██║   ██║██║  ██║██╔══╝  ") | color(pal.logo),
-        text("   ╚██████╔╝ ╚████╔╝ ██║      ╚██████╗╚██████╔╝██████╔╝███████╗") | color(pal.logo),
-        text("    ╚═════╝   ╚═══╝  ╚═╝       ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝") | color(pal.logo),
-        text("         Read · Edit · Reason · Refactor · Run") |
-            color(pal.logo_subtitle) | dim,
     });
 }
 
@@ -563,31 +551,254 @@ const char* kindLabel(TranscriptEntry::Kind k) {
     switch (k) {
         case TranscriptEntry::Kind::User:       return "you";
         case TranscriptEntry::Kind::Assistant:  return "assistant";
-        case TranscriptEntry::Kind::ToolCall:   return "tool→";
-        case TranscriptEntry::Kind::ToolResult: return "tool←";
+        case TranscriptEntry::Kind::ToolCall:   return "tool →";
+        case TranscriptEntry::Kind::ToolResult: return "tool ←";
         case TranscriptEntry::Kind::System:     return "system";
         case TranscriptEntry::Kind::Error:      return "error";
     }
     return "?";
 }
 
+// A transcript body that begins with "--- a/" is treated as a unified-diff
+// block: per-line colorize `+`/`-`/`@` so edits read like a git diff.
+Element renderDiffBody(const Palette& pal, const std::string& body) {
+    std::vector<Element> rows;
+    std::istringstream is(body);
+    std::string line;
+    while (std::getline(is, line)) {
+        if (line.empty()) { rows.push_back(text(" ")); continue; }
+        char c = line[0];
+        if (c == '+')      rows.push_back(text(line) | color(pal.assistant_entry));
+        else if (c == '-') rows.push_back(text(line) | color(pal.error));
+        else if (c == '@') rows.push_back(text(line) | color(pal.accent) | bold);
+        else               rows.push_back(text(line) | color(pal.muted));
+    }
+    if (rows.empty()) rows.push_back(text(" "));
+    return vbox(std::move(rows));
+}
+
 Element renderEntry(const Palette& pal, const TranscriptEntry& e) {
+    // "done" is the synthetic marker the chat loop pushes when a turn
+    // finishes successfully — render it as a bold green banner.
+    if (e.kind == TranscriptEntry::Kind::System && e.title == "done") {
+        return vbox({
+                   text(std::string("✓ done · ") + e.body) |
+                       color(pal.assistant_entry) | bold,
+                   text(""),
+               }) |
+               xflex;
+    }
     auto header = text(std::string("● ") + kindLabel(e.kind) +
                        (e.title.empty() ? "" : " · " + e.title)) |
                   color(kindColor(pal, e.kind)) | bold;
-    std::vector<Element> body_lines;
-    std::istringstream is(e.body);
-    std::string line;
-    while (std::getline(is, line)) {
-        body_lines.push_back(paragraph(line));
+    bool is_diff = e.body.rfind("--- a/", 0) == 0;
+    Element body;
+    if (is_diff) {
+        body = renderDiffBody(pal, e.body);
+    } else {
+        std::vector<Element> body_lines;
+        std::istringstream is(e.body);
+        std::string line;
+        while (std::getline(is, line)) body_lines.push_back(paragraph(line));
+        if (body_lines.empty()) body_lines.push_back(text(""));
+        body = vbox(body_lines) | dim;
     }
-    if (body_lines.empty()) body_lines.push_back(text(""));
-    return vbox({
-               header,
-               vbox(body_lines) | dim,
-               text(""),
-           }) |
-           xflex;
+    return vbox({header, body, text("")}) | xflex;
+}
+
+// ---- Vim-style multi-line editor ----------------------------------------
+//
+// We don't reuse FTXUI's Input here: Input is single-line, paints its own
+// inverted/blinking cursor (which the user reported as "white/flashing"),
+// and has no notion of modes. Instead the chat screen owns a VimEditor and
+// renders it manually. A hidden Input still sits in the component tree only
+// to absorb focus so events reach our CatchEvent handler.
+struct VimEditor {
+    std::vector<std::string> lines{""};
+    int row = 0;
+    int col = 0;
+    ChatMode mode = ChatMode::Insert;
+    std::string pending_op;  // first key of a 2-key motion like "dd"/"gg"
+
+    bool isEmpty() const {
+        return lines.size() == 1 && lines[0].empty();
+    }
+
+    std::string toString() const {
+        std::string out;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            out += lines[i];
+            if (i + 1 < lines.size()) out += "\n";
+        }
+        return out;
+    }
+
+    void clearBuffer() {
+        lines = {""};
+        row = col = 0;
+        pending_op.clear();
+    }
+
+    void clampCursor() {
+        if (lines.empty()) lines.push_back("");
+        if (row < 0) row = 0;
+        if (row >= (int)lines.size()) row = (int)lines.size() - 1;
+        int maxc = (int)lines[row].size();
+        if (mode == ChatMode::Insert) {
+            if (col < 0) col = 0;
+            if (col > maxc) col = maxc;
+        } else {
+            if (col < 0) col = 0;
+            if (col > std::max(0, maxc - 1)) col = std::max(0, maxc - 1);
+        }
+    }
+
+    void insertString(const std::string& s) {
+        lines[row].insert(col, s);
+        col += (int)s.size();
+    }
+
+    void insertNewline() {
+        std::string rest = lines[row].substr(col);
+        lines[row].resize(col);
+        lines.insert(lines.begin() + row + 1, rest);
+        ++row;
+        col = 0;
+    }
+
+    void backspace() {
+        if (col > 0) {
+            lines[row].erase(col - 1, 1);
+            --col;
+        } else if (row > 0) {
+            col = (int)lines[row - 1].size();
+            lines[row - 1] += lines[row];
+            lines.erase(lines.begin() + row);
+            --row;
+        }
+    }
+
+    void deleteCharUnder() {
+        if (col < (int)lines[row].size()) lines[row].erase(col, 1);
+        clampCursor();
+    }
+
+    void deleteLine() {
+        lines.erase(lines.begin() + row);
+        if (lines.empty()) lines.push_back("");
+        if (row >= (int)lines.size()) row = (int)lines.size() - 1;
+        col = 0;
+    }
+
+    void openLineBelow() {
+        lines.insert(lines.begin() + row + 1, "");
+        ++row;
+        col = 0;
+        mode = ChatMode::Insert;
+    }
+
+    void openLineAbove() {
+        lines.insert(lines.begin() + row, "");
+        col = 0;
+        mode = ChatMode::Insert;
+    }
+
+    void moveLeft()  { if (col > 0) --col; }
+    void moveRight() {
+        int limit = (int)lines[row].size();
+        if (mode == ChatMode::Normal && limit > 0) limit -= 1;
+        if (col < limit) ++col;
+    }
+    void moveUp()   { if (row > 0) { --row; clampCursor(); } }
+    void moveDown() { if (row + 1 < (int)lines.size()) { ++row; clampCursor(); } }
+    void lineStart() { col = 0; }
+    void lineEnd() {
+        col = (int)lines[row].size();
+        if (mode == ChatMode::Normal && col > 0) --col;
+    }
+    void firstLine() { row = 0; col = 0; clampCursor(); }
+    void lastLine()  { row = (int)lines.size() - 1; col = 0; clampCursor(); }
+
+    static bool isWordChar(char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    }
+
+    void wordForward() {
+        const std::string& l = lines[row];
+        int n = (int)l.size();
+        int c = col;
+        while (c < n && isWordChar(l[c])) ++c;
+        while (c < n && !isWordChar(l[c])) ++c;
+        if (c >= n && row + 1 < (int)lines.size()) { ++row; col = 0; }
+        else col = c;
+        clampCursor();
+    }
+
+    void wordBack() {
+        if (col == 0) {
+            if (row > 0) { --row; col = (int)lines[row].size(); }
+            clampCursor();
+            return;
+        }
+        const std::string& l = lines[row];
+        int c = col - 1;
+        while (c > 0 && !isWordChar(l[c])) --c;
+        while (c > 0 && isWordChar(l[c - 1])) --c;
+        col = c;
+        clampCursor();
+    }
+};
+
+Element renderEditor(const VimEditor& ed, const Palette& pal,
+                     bool minimized = false) {
+    int total = (int)ed.lines.size();
+    int width_digits = 2;
+    for (int n = total; n >= 100; n /= 10) ++width_digits;
+
+    Color cursor_color = (ed.mode == ChatMode::Insert)
+                             ? pal.insert_mode
+                             : pal.normal_mode;
+
+    auto renderRow = [&](int r) -> Element {
+        std::string num = std::to_string(r + 1);
+        while ((int)num.size() < width_digits) num.insert(num.begin(), ' ');
+        bool current = (r == ed.row);
+        Element gutter = current
+            ? (text(num + " │ ") | color(cursor_color) | bold)
+            : (text(num + " │ ") | color(pal.muted));
+
+        const std::string& line = ed.lines[r];
+        Element content;
+        if (current) {
+            bool past_end = ed.col >= (int)line.size();
+            std::string left  = past_end ? line : line.substr(0, ed.col);
+            std::string under = past_end ? " "  : line.substr(ed.col, 1);
+            std::string right = past_end ? ""   : line.substr(ed.col + 1);
+            auto cursor_cell = text(under) | inverted | color(cursor_color);
+            content = hbox({text(left), cursor_cell, text(right), filler()});
+        } else {
+            content = hbox({text(line.empty() ? " " : line), filler()});
+        }
+        return hbox({gutter, content});
+    };
+
+    if (minimized) {
+        // Single-line view: show only the row the cursor is on, plus an
+        // indicator of how many lines the full buffer holds.
+        std::string indicator = "  (" + std::to_string(ed.row + 1) + "/" +
+                                std::to_string(total) + ")";
+        return hbox({
+            renderRow(ed.row),
+            text(indicator) | color(pal.muted) | dim,
+        });
+    }
+
+    std::vector<Element> rows;
+    rows.reserve(ed.lines.size());
+    for (size_t r = 0; r < ed.lines.size(); ++r) {
+        rows.push_back(renderRow((int)r));
+    }
+    return vbox(std::move(rows));
 }
 
 }  // namespace
@@ -601,12 +812,14 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     std::vector<TranscriptEntry> transcript;
     std::atomic<bool> busy{false};
     std::atomic<bool> stop_requested{false};
-    std::string input_value;
     std::thread worker;
 
-    // Cap transcript memory + per-frame render cost. When we exceed the
-    // hard cap, trim back to the keep target in one shot to amortize the
-    // vector::erase. Caller must hold `mu`.
+    VimEditor editor;
+    // Ctrl+Tab toggles a single-line "minimized" view of the input panel so
+    // the output area takes the whole screen while the prompt buffer is kept.
+    bool input_minimized = false;
+
+    // Cap transcript memory + per-frame render cost.
     constexpr size_t kTranscriptHardCap = 1000;
     constexpr size_t kTranscriptKeep    = 900;
     auto pushEntryLocked = [&](TranscriptEntry e) {
@@ -634,20 +847,18 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                              techniqueLabel(cfg.technique)});
         pushEntryLocked(
             {TranscriptEntry::Kind::System, "hints",
-             "Insert mode (default): type, Enter sends, Esc → Normal mode.  "
-             "Normal mode: i/a/Enter insert · q quit · s settings · t "
-             "technique · c clear."});
+             "INSERT: type freely · Enter = newline · Esc → NORMAL.   "
+             "NORMAL: Enter sends · h j k l move · w b word · 0 $ line · "
+             "gg G top/bot · i a o O I A insert · x delete · dd cut line · "
+             "q quit · s settings · t technique · c clear · z toggle min."});
     }
 
     enum class Next { Quit, OpenSettings };
     Next next = Next::Quit;
-    ChatMode mode = ChatMode::Insert;
 
     while (true) {
     auto screen = ScreenInteractive::Fullscreen();
     next = Next::Quit;
-
-    auto input = Input(&input_value, "ask, edit, or ship code…");
 
     auto send_turn = [&](std::string prompt) {
         if (busy.exchange(true)) return;
@@ -664,6 +875,12 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                         screen.PostEvent(Event::Custom);
                         return !stop_requested.load();
                     });
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                if (!stop_requested.load())
+                    pushEntryLocked({TranscriptEntry::Kind::System, "done",
+                                     "Turn complete."});
+            }
             busy.store(false);
             screen.PostEvent(Event::Custom);
         });
@@ -694,46 +911,136 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         transcript.clear();
     };
 
-    auto input_with_events = CatchEvent(input, [&](Event e) {
-        if (mode == ChatMode::Normal) {
-            // Single-letter commands; swallow every other key so the input
-            // stays untouched while in Normal mode.
-            if (e == Event::Character("i") || e == Event::Character("a") ||
-                e == Event::Return) {
-                mode = ChatMode::Insert;
+    auto submit_buffer = [&] {
+        if (busy.load() || editor.isEmpty()) return;
+        auto p = editor.toString();
+        editor.clearBuffer();
+        editor.mode = ChatMode::Insert;
+        send_turn(p);
+    };
+
+    // The hidden Input only exists to claim focus so events reach our
+    // CatchEvent handler — we never render it.
+    std::string sink_value;
+    auto sink = Input(&sink_value, "");
+
+    auto editor_events = CatchEvent(sink, [&](Event e) {
+        // Ignore the screen-redraw "Custom" event.
+        if (e == Event::Custom) return false;
+        // Clear sink_value continuously so the hidden input never accumulates.
+        sink_value.clear();
+
+        if (editor.mode == ChatMode::Insert) {
+            if (e == Event::Escape) {
+                editor.mode = ChatMode::Normal;
+                editor.clampCursor();
                 return true;
             }
-            if (e == Event::Character("q")) {
-                next = Next::Quit;
-                screen.ExitLoopClosure()();
+            if (e == Event::Return) { editor.insertNewline(); return true; }
+            if (e == Event::Backspace) { editor.backspace(); return true; }
+            if (e == Event::Delete) { editor.deleteCharUnder(); return true; }
+            if (e == Event::ArrowLeft)  { editor.moveLeft();  return true; }
+            if (e == Event::ArrowRight) { editor.moveRight(); return true; }
+            if (e == Event::ArrowUp)    { editor.moveUp();    return true; }
+            if (e == Event::ArrowDown)  { editor.moveDown();  return true; }
+            if (e == Event::Home)       { editor.lineStart(); return true; }
+            if (e == Event::End)        { editor.lineEnd();   return true; }
+            if (e == Event::Tab) { editor.insertString("    "); return true; }
+            if (e.is_character()) {
+                editor.insertString(e.character());
                 return true;
             }
-            if (e == Event::Character("s")) { open_settings();     return true; }
-            if (e == Event::Character("t")) { cycle_technique();   return true; }
-            if (e == Event::Character("c")) { clear_transcript();  return true; }
-            return true;  // eat the event regardless
+            return true;
         }
 
-        // Insert mode.
-        if (e == Event::Escape) {
-            mode = ChatMode::Normal;
+        // ---- Normal mode ----
+        // Two-key motions: pending_op stores the leader.
+        if (!editor.pending_op.empty()) {
+            std::string op = editor.pending_op;
+            editor.pending_op.clear();
+            if (op == "d" && e == Event::Character("d")) {
+                editor.deleteLine();
+                return true;
+            }
+            if (op == "g" && e == Event::Character("g")) {
+                editor.firstLine();
+                return true;
+            }
+            // Any other key: fall through and re-process below.
+        }
+
+        if (e == Event::Return) { submit_buffer(); return true; }
+        if (e == Event::Escape) { return true; }
+
+        // Cursor motions
+        if (e == Event::Character("h") || e == Event::ArrowLeft) {
+            editor.moveLeft(); return true;
+        }
+        if (e == Event::Character("l") || e == Event::ArrowRight) {
+            editor.moveRight(); return true;
+        }
+        if (e == Event::Character("j") || e == Event::ArrowDown) {
+            editor.moveDown(); return true;
+        }
+        if (e == Event::Character("k") || e == Event::ArrowUp) {
+            editor.moveUp(); return true;
+        }
+        if (e == Event::Character("0") || e == Event::Home) {
+            editor.lineStart(); return true;
+        }
+        if (e == Event::Character("$") || e == Event::End) {
+            editor.lineEnd(); return true;
+        }
+        if (e == Event::Character("w")) { editor.wordForward(); return true; }
+        if (e == Event::Character("b")) { editor.wordBack();    return true; }
+        if (e == Event::Character("G")) { editor.lastLine();    return true; }
+
+        // Editing
+        if (e == Event::Character("x")) { editor.deleteCharUnder(); return true; }
+        if (e == Event::Character("o")) { editor.openLineBelow();   return true; }
+        if (e == Event::Character("O")) { editor.openLineAbove();   return true; }
+        if (e == Event::Character("i")) {
+            editor.mode = ChatMode::Insert; editor.clampCursor(); return true;
+        }
+        if (e == Event::Character("a")) {
+            editor.mode = ChatMode::Insert;
+            if (editor.col < (int)editor.lines[editor.row].size()) ++editor.col;
+            editor.clampCursor();
             return true;
         }
-        if (e == Event::Return) {
-            if (busy.load() || input_value.empty()) return true;
-            auto p = input_value;
-            input_value.clear();
-            send_turn(p);
+        if (e == Event::Character("I")) {
+            editor.mode = ChatMode::Insert; editor.col = 0; return true;
+        }
+        if (e == Event::Character("A")) {
+            editor.mode = ChatMode::Insert;
+            editor.col = (int)editor.lines[editor.row].size();
             return true;
         }
-        return false;
+
+        // Leaders for 2-key motions
+        if (e == Event::Character("d")) { editor.pending_op = "d"; return true; }
+        if (e == Event::Character("g")) { editor.pending_op = "g"; return true; }
+
+        // App commands (override the vim equivalents we don't implement)
+        if (e == Event::Character("q")) {
+            next = Next::Quit;
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        if (e == Event::Character("s")) { open_settings();    return true; }
+        if (e == Event::Character("t")) { cycle_technique();  return true; }
+        if (e == Event::Character("c")) { clear_transcript(); return true; }
+        if (e == Event::Character("z")) {
+            input_minimized = !input_minimized;
+            return true;
+        }
+        return true;
     });
 
-    auto root = Container::Vertical({input_with_events});
+    auto root = Container::Vertical({editor_events});
 
     auto renderer = Renderer(root, [&] {
         const Palette& pal = palette(cfg.theme);
-        bool wide_enough = Terminal::Size().dimx >= 72;
 
         std::vector<Element> rendered;
         {
@@ -743,25 +1050,23 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                 rendered.push_back(renderEntry(pal, e));
         }
         if (rendered.empty()) rendered.push_back(text(""));
+        // Pin to bottom so new output is always visible.
         Element scroll =
-            vbox(rendered) | yframe | focusPositionRelative(0.f, 1.f) | yflex;
+            vbox(rendered) | yframe | focusPositionRelative(0.f, 1.f);
 
         std::string status = busy.load() ? " thinking… " : " ready ";
         Color status_color = busy.load() ? pal.busy : pal.ready;
-        bool insert = (mode == ChatMode::Insert);
+        bool insert = (editor.mode == ChatMode::Insert);
         std::string mode_tag = insert ? " -- INSERT -- " : " -- NORMAL -- ";
         Color mode_color = insert ? pal.insert_mode : pal.normal_mode;
-        const char* prompt_glyph = insert ? "> " : ": ";
 
         std::string footer =
             insert
-                ? "INSERT  ·  Enter send  ·  Esc → Normal mode"
-                : "NORMAL  ·  i/a/Enter insert  ·  q quit  ·  s settings  "
-                  "·  t technique  ·  c clear";
+                ? "INSERT  ·  Enter newline  ·  Esc → NORMAL"
+                : "NORMAL  ·  Enter send  ·  h j k l move  ·  w b word  ·  "
+                  "i a o O I A insert  ·  x dd  ·  z min  ·  q s t c";
 
-        std::vector<Element> rows;
-        if (wide_enough) rows.push_back(splashLogo(pal) | center);
-        rows.push_back(
+        Element header_bar =
             hbox({
                 text("ovi-code") | bold | color(pal.accent),
                 text("  "),
@@ -775,17 +1080,43 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                 text(" "),
                 text(status) | color(status_color) | bold,
             }) |
-            borderRounded | color(pal.border));
-        rows.push_back(scroll | border | color(pal.border) | flex);
-        rows.push_back(
-            hbox({
-                text(prompt_glyph) | color(mode_color),
-                input->Render() | flex,
-            }) |
-            border | color(pal.border));
-        rows.push_back(text(footer) | color(pal.muted) | dim | center);
+            borderRounded | color(pal.border);
 
-        return vbox(std::move(rows)) | flex;
+        Element output_panel =
+            window(text(" output ") | color(pal.accent) | bold,
+                   scroll) |
+            color(pal.border) | flex;
+
+        Element input_body = input_minimized
+            ? renderEditor(editor, pal, true)
+            : renderEditor(editor, pal, false) | yframe |
+                  focusPositionRelative(0.f, 1.f);
+
+        Element input_panel =
+            window(hbox({
+                       text(" input ") | color(pal.accent) | bold,
+                       text(insert ? "[INSERT]" : "[NORMAL]") |
+                           color(mode_color),
+                       text(input_minimized ? "  [MIN]" : "") |
+                           color(pal.muted),
+                   }),
+                   input_body) |
+            color(pal.border);
+
+        // In minimized mode pin the panel to a fixed three-row height (top
+        // border + single editor row + bottom border) so the output area
+        // takes the rest of the screen. Otherwise let it flex.
+        input_panel = input_minimized
+            ? input_panel | size(HEIGHT, EQUAL, 3)
+            : input_panel | flex;
+
+        return vbox({
+                   header_bar,
+                   output_panel,
+                   input_panel,
+                   text(footer) | color(pal.muted) | dim | center,
+               }) |
+               flex;
     });
 
     screen.Loop(renderer);

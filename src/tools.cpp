@@ -190,6 +190,38 @@ ToolResult runListFiles(const fs::path& workspace, const ToolCall& call) {
     return r;
 }
 
+std::vector<std::string> splitLines(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == '\n') { out.push_back(cur); cur.clear(); }
+        else cur.push_back(c);
+    }
+    out.push_back(cur);
+    return out;
+}
+
+// Render a minimal unified-diff-like block for the user/LLM. We don't compute
+// LCS — we just print every "before" line with `-` and every "after" line
+// with `+`. That keeps the implementation tiny while still being a clear,
+// human- and model-readable change description.
+std::string buildEditDiff(const std::string& path,
+                          const std::string& old_str,
+                          const std::string& new_str) {
+    std::ostringstream ss;
+    ss << "--- a/" << path << "\n";
+    ss << "+++ b/" << path << "\n";
+    auto olds = splitLines(old_str);
+    auto news = splitLines(new_str);
+    // Drop trailing empty line introduced by terminal newline.
+    if (!olds.empty() && olds.back().empty()) olds.pop_back();
+    if (!news.empty() && news.back().empty()) news.pop_back();
+    ss << "@@ " << olds.size() << " → " << news.size() << " lines @@\n";
+    for (const auto& l : olds) ss << "-" << l << "\n";
+    for (const auto& l : news) ss << "+" << l << "\n";
+    return ss.str();
+}
+
 ToolResult runEditFile(const fs::path& workspace, const ToolCall& call) {
     ToolResult r{call.id, call.name, "", false};
     for (const char* k : {"path", "old_str", "new_str"}) {
@@ -225,8 +257,8 @@ ToolResult runEditFile(const fs::path& workspace, const ToolCall& call) {
             r.content = "Failed to create file.";
             return r;
         }
-        r.content = "Created " + rel + " (" +
-                    std::to_string(new_str.size()) + " bytes).";
+        r.content = buildEditDiff(rel, "", new_str) +
+                    "(created " + std::to_string(new_str.size()) + " bytes)\n";
         return r;
     }
 
@@ -271,7 +303,7 @@ ToolResult runEditFile(const fs::path& workspace, const ToolCall& call) {
         r.content = "Failed to write file.";
         return r;
     }
-    r.content = "Edited " + rel + " (one replacement).";
+    r.content = buildEditDiff(rel, old_str, new_str);
     return r;
 }
 
