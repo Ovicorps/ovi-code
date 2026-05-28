@@ -22,9 +22,10 @@ enum class Technique {
 };
 
 enum class Theme {
-    Auto,
+    Auto,   // Follow system / terminal (auto-detected)
     Dark,
     Light,
+    Plain,  // No colors — terminal-default foreground only
 };
 
 struct ProviderInfo {

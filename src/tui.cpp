@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <sstream>
@@ -57,6 +58,11 @@ struct Palette {
     Color error;
     Color logo;
     Color logo_subtitle;
+    // Plain mode collapses every slot to Color::Default. We still expose the
+    // flag so call sites can suppress contrast-reducing modifiers (notably
+    // the `dim` body styling) — otherwise transcript bodies render gray on
+    // gray and become unreadable in monochrome terminals.
+    bool plain = false;
 };
 
 Palette darkPalette() {
@@ -77,6 +83,7 @@ Palette darkPalette() {
         /*error          */ Color::RedLight,
         /*logo           */ Color::CyanLight,
         /*logo_subtitle  */ Color::GrayLight,
+        /*plain          */ false,
     };
 }
 
@@ -84,8 +91,10 @@ Palette lightPalette() {
     // Light terminals: the bright/“Light” FTXUI variants wash out against a
     // white background. Use the saturated base colors plus dark gray for
     // muted text — these stay readable on Solarized Light, Apple Light, etc.
+    // Border uses GrayDark (not GrayLight) so the frame actually shows up
+    // against a near-white background.
     return Palette{
-        /*border         */ Color::GrayLight,
+        /*border         */ Color::GrayDark,
         /*accent         */ Color::Blue,
         /*muted          */ Color::GrayDark,
         /*insert_mode    */ Color::Green,
@@ -101,34 +110,95 @@ Palette lightPalette() {
         /*error          */ Color::Red,
         /*logo           */ Color::Blue,
         /*logo_subtitle  */ Color::GrayDark,
+        /*plain          */ false,
     };
 }
 
-// COLORFGBG is "fg;bg" or "fg;default;bg". Background index <= 6 means a
-// dark terminal, >= 7 means light. (rxvt sometimes emits "default" — we
-// then assume dark.)
-bool detectDarkBackground() {
-    const char* v = std::getenv("COLORFGBG");
-    if (!v || !*v) return true;
-    std::string s = v;
-    auto last = s.find_last_of(';');
-    if (last == std::string::npos) return true;
-    std::string bg = s.substr(last + 1);
-    try {
-        int n = std::stoi(bg);
-        return n < 7;
-    } catch (...) {
+Palette plainPalette() {
+    // Every slot resolves to the terminal's default foreground color, so the
+    // TUI renders as monochrome plain text regardless of light/dark
+    // background. Bold/inverted modifiers still apply (we need them for the
+    // cursor cell and headings) but no hue is ever emitted.
+    Color d = Color::Default;
+    return Palette{
+        /*border         */ d,
+        /*accent         */ d,
+        /*muted          */ d,
+        /*insert_mode    */ d,
+        /*normal_mode    */ d,
+        /*busy           */ d,
+        /*ready          */ d,
+        /*technique      */ d,
+        /*user_entry     */ d,
+        /*assistant_entry*/ d,
+        /*tool_call      */ d,
+        /*tool_result    */ d,
+        /*system_entry   */ d,
+        /*error          */ d,
+        /*logo           */ d,
+        /*logo_subtitle  */ d,
+        /*plain          */ true,
+    };
+}
+
+// System theme detection. Probed once per process and cached — re-running
+// `defaults` on every render would be wasteful, and the user can always pick
+// Dark / Light / Plain explicitly if their environment doesn't auto-detect.
+//
+// Order of evidence:
+//   1. $COLORFGBG  ("fg;bg" or "fg;default;bg") — set by xterm-family
+//      emulators, iTerm2, kitty, alacritty, wezterm. Background index <= 6
+//      = dark, >= 7 = light. Authoritative when present because it reflects
+//      the user's actual terminal colors, not the OS UI mode.
+//   2. macOS Appearance — `defaults read -g AppleInterfaceStyle` prints
+//      "Dark" when the system is in Dark Mode and exits non-zero when in
+//      Light Mode. Only consulted when COLORFGBG is absent or unparseable.
+//   3. Default to Dark — most dev terminals are dark, and the dark palette
+//      degrades more gracefully than the light one on unknown backgrounds.
+bool detectSystemDarkBackground() {
+    static const bool cached = []() -> bool {
+        if (const char* v = std::getenv("COLORFGBG"); v && *v) {
+            std::string s = v;
+            auto last = s.find_last_of(';');
+            if (last != std::string::npos) {
+                try {
+                    return std::stoi(s.substr(last + 1)) < 7;
+                } catch (...) {
+                    // fall through to other probes
+                }
+            }
+        }
+#ifdef __APPLE__
+        if (FILE* p = ::popen(
+                "defaults read -g AppleInterfaceStyle 2>/dev/null", "r")) {
+            char buf[64] = {0};
+            std::size_t n = std::fread(buf, 1, sizeof(buf) - 1, p);
+            int rc = ::pclose(p);
+            if (rc == 0) {
+                std::string s(buf, n);
+                // Successful read with "Dark" in the value = Dark Mode.
+                // Successful read with anything else (rare) — treat as light.
+                // Non-zero rc means the key is unset → Light Mode.
+                return s.find("Dark") != std::string::npos;
+            }
+            return false;  // key unset = Light Mode on macOS
+        }
+#endif
         return true;
-    }
+    }();
+    return cached;
 }
 
 const Palette& palette(Theme t) {
     static const Palette dark  = darkPalette();
     static const Palette light = lightPalette();
+    static const Palette plain = plainPalette();
     switch (t) {
         case Theme::Dark:  return dark;
         case Theme::Light: return light;
-        case Theme::Auto:  return detectDarkBackground() ? dark : light;
+        case Theme::Plain: return plain;
+        case Theme::Auto:
+            return detectSystemDarkBackground() ? dark : light;
     }
     return dark;
 }
@@ -601,7 +671,11 @@ Element renderEntry(const Palette& pal, const TranscriptEntry& e) {
         std::string line;
         while (std::getline(is, line)) body_lines.push_back(paragraph(line));
         if (body_lines.empty()) body_lines.push_back(text(""));
-        body = vbox(body_lines) | dim;
+        // In Plain mode we drop `dim` — without it the body is the only
+        // signal carrying the transcript content, and dim-on-default is
+        // unreadable in monochrome terminals where there's no color to
+        // distinguish title from body.
+        body = pal.plain ? vbox(body_lines) : vbox(body_lines) | dim;
     }
     return vbox({header, body, text("")}) | xflex;
 }
@@ -1105,10 +1179,13 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
 
         // In minimized mode pin the panel to a fixed three-row height (top
         // border + single editor row + bottom border) so the output area
-        // takes the rest of the screen. Otherwise let it flex.
+        // takes the rest of the screen. Otherwise guarantee a minimum height
+        // so the prompt panel is always visible (output_panel | flex absorbs
+        // the rest); without this the vbox can squeeze the input to zero rows
+        // on small terminals or when transcript output dominates.
         input_panel = input_minimized
             ? input_panel | size(HEIGHT, EQUAL, 3)
-            : input_panel | flex;
+            : input_panel | size(HEIGHT, GREATER_THAN, 8);
 
         return vbox({
                    header_bar,

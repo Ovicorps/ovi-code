@@ -105,37 +105,43 @@ const std::vector<Technique>& allTechniques() {
 
 std::string themeLabel(Theme t) {
     switch (t) {
-        case Theme::Auto:  return "Auto (detect from terminal)";
+        case Theme::Auto:  return "System (auto-detect)";
         case Theme::Dark:  return "Dark";
         case Theme::Light: return "Light";
+        case Theme::Plain: return "Plain (no colors)";
     }
-    return "Auto";
+    return "System (auto-detect)";
 }
 
 std::string themeDescription(Theme t) {
     switch (t) {
         case Theme::Auto:
-            return "Choose Dark or Light based on $COLORFGBG (falls back to Dark).";
+            return "Follow the OS / terminal: macOS Appearance, then $COLORFGBG, then Dark.";
         case Theme::Dark:
             return "Bright accents on a dark background.";
         case Theme::Light:
             return "Saturated mid-tones legible on a light background.";
+        case Theme::Plain:
+            return "Monochrome: terminal-default foreground, no accent colors.";
     }
     return "";
 }
 
 std::string themeToString(Theme t) {
     switch (t) {
-        case Theme::Auto:  return "auto";
+        case Theme::Auto:  return "system";
         case Theme::Dark:  return "dark";
         case Theme::Light: return "light";
+        case Theme::Plain: return "plain";
     }
-    return "auto";
+    return "system";
 }
 
 Theme themeFromString(const std::string& s) {
     if (s == "dark")  return Theme::Dark;
     if (s == "light") return Theme::Light;
+    if (s == "plain") return Theme::Plain;
+    // "auto" accepted for back-compat with configs written before the rename.
     return Theme::Auto;
 }
 
@@ -144,6 +150,7 @@ const std::vector<Theme>& allThemes() {
         Theme::Auto,
         Theme::Dark,
         Theme::Light,
+        Theme::Plain,
     };
     return v;
 }
