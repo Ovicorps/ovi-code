@@ -6,11 +6,11 @@ Agent*. ReAct-style tool loop, three file tools (`read_file`, `list_files`,
 
 ## Features
 
-- **Providers**: Anthropic, OpenAI, Google Gemini, Ollama (local).
+- **Providers**: Anthropic, OpenAI, Google Gemini, llama.cpp (local).
 - **Setup wizard** on first run: pick provider, paste API key, pick model.
 - **TUI**: full-screen chat with live transcript of model output, tool calls,
-  and tool results. In-app settings panel (Ctrl+S), technique switcher
-  (Ctrl+T), clear (Ctrl+L), quit (Ctrl+Q).
+  and tool results. Vim-style modal input (Insert by default; Esc → Normal)
+  with single-key actions for settings, technique, clear, and quit.
 - **Agentic techniques** (selectable at runtime):
   - **Standard** — plain ReAct.
   - **Chain of Thought** — adds a reasoning preamble.
@@ -45,19 +45,33 @@ The binary lands at `build/ovi-code`.
 
 The first launch opens a 4-step setup wizard: provider → API key →
 model → default technique. Settings persist to
-`~/.config/ovi-code/config.json` (mode 0600).
+`~/.ovi-code/config.json` (mode 0600).
 
 You can override the saved key at runtime with `OVI_CODE_API_KEY`.
 
 ## Keybindings (chat screen)
 
-| Key       | Action                          |
-| --------- | ------------------------------- |
-| `Enter`   | Send the prompt                 |
-| `Ctrl+S`  | Open settings                   |
-| `Ctrl+T`  | Cycle agentic technique         |
-| `Ctrl+L`  | Clear the transcript view       |
-| `Ctrl+Q`  | Quit                            |
+The chat screen is modal, vim-style. You start in **Insert** mode (typing
+fills the prompt). Hit `Esc` to enter **Normal** mode where single letters
+drive actions. No Ctrl-key shortcuts — those collide with terminal
+XON/XOFF flow control on many setups.
+
+### Insert mode
+
+| Key     | Action                          |
+| ------- | ------------------------------- |
+| `Enter` | Send the prompt                 |
+| `Esc`   | Switch to Normal mode           |
+
+### Normal mode
+
+| Key                  | Action                    |
+| -------------------- | ------------------------- |
+| `i` / `a` / `Enter`  | Back to Insert mode       |
+| `q`                  | Quit                      |
+| `s`                  | Open settings             |
+| `t`                  | Cycle agentic technique   |
+| `c`                  | Clear the transcript view |
 
 ## Tools exposed to the model
 

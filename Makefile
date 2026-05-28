@@ -18,7 +18,7 @@ install: build
 	sudo install -m 755 $(BUILD_DIR)/$(BINARY) $(DESTDIR)$(PREFIX)/bin/$(BINARY)
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/$(BINARY)
+	sudo rm -f $(DESTDIR)$(PREFIX)/bin/$(BINARY)
 
 clean:
 	rm -rf $(BUILD_DIR)

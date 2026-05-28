@@ -45,6 +45,12 @@ Response post(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds);
+    // Fail fast on unreachable hosts (DNS / TCP) rather than waiting for the
+    // full per-request timeout — keeps the TUI's worker thread responsive.
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 60L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "ovi-code/0.1 (+libcurl)");

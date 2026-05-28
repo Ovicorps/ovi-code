@@ -16,11 +16,11 @@ const std::vector<ProviderInfo>& knownProviders() {
     static const std::vector<ProviderInfo> v = {
         {Provider::Anthropic, "Anthropic (Claude)", "claude-sonnet-4-6",
          "https://api.anthropic.com", true},
-        {Provider::OpenAI, "OpenAI", "gpt-4o", "https://api.openai.com", true},
-        {Provider::Gemini, "Google Gemini", "gemini-2.0-flash",
+        {Provider::OpenAI, "OpenAI", "gpt-5.4", "https://api.openai.com", true},
+        {Provider::Gemini, "Google Gemini", "gemini-2.5-flash",
          "https://generativelanguage.googleapis.com", true},
-        {Provider::Ollama, "Local (Ollama)", "llama3.1",
-         "http://localhost:11434", false},
+        {Provider::Llamacpp, "Local (llama.cpp)", "local-model",
+         "http://localhost:8080", false},
     };
     return v;
 }
@@ -39,7 +39,7 @@ std::string providerToString(Provider p) {
         case Provider::Anthropic: return "anthropic";
         case Provider::OpenAI:    return "openai";
         case Provider::Gemini:    return "gemini";
-        case Provider::Ollama:    return "ollama";
+        case Provider::Llamacpp:  return "llamacpp";
     }
     return "anthropic";
 }
@@ -48,7 +48,7 @@ Provider providerFromString(const std::string& s) {
     if (s == "anthropic") return Provider::Anthropic;
     if (s == "openai")    return Provider::OpenAI;
     if (s == "gemini")    return Provider::Gemini;
-    if (s == "ollama")    return Provider::Ollama;
+    if (s == "llamacpp")  return Provider::Llamacpp;
     return Provider::Anthropic;
 }
 
@@ -103,51 +103,123 @@ const std::vector<Technique>& allTechniques() {
     return v;
 }
 
+std::string themeLabel(Theme t) {
+    switch (t) {
+        case Theme::Auto:  return "Auto (detect from terminal)";
+        case Theme::Dark:  return "Dark";
+        case Theme::Light: return "Light";
+    }
+    return "Auto";
+}
+
+std::string themeDescription(Theme t) {
+    switch (t) {
+        case Theme::Auto:
+            return "Choose Dark or Light based on $COLORFGBG (falls back to Dark).";
+        case Theme::Dark:
+            return "Bright accents on a dark background.";
+        case Theme::Light:
+            return "Saturated mid-tones legible on a light background.";
+    }
+    return "";
+}
+
+std::string themeToString(Theme t) {
+    switch (t) {
+        case Theme::Auto:  return "auto";
+        case Theme::Dark:  return "dark";
+        case Theme::Light: return "light";
+    }
+    return "auto";
+}
+
+Theme themeFromString(const std::string& s) {
+    if (s == "dark")  return Theme::Dark;
+    if (s == "light") return Theme::Light;
+    return Theme::Auto;
+}
+
+const std::vector<Theme>& allThemes() {
+    static const std::vector<Theme> v = {
+        Theme::Auto,
+        Theme::Dark,
+        Theme::Light,
+    };
+    return v;
+}
+
 const std::vector<std::string>& knownModels(Provider p) {
     static const std::vector<std::string> anthropic = {
         "claude-opus-4-7",
         "claude-sonnet-4-6",
         "claude-haiku-4-5-20251001",
-        "claude-3-5-sonnet-latest",
+        "claude-opus-4-6",
+        "claude-sonnet-4-5-20250929",
+        "claude-opus-4-5-20251101",
+        "claude-opus-4-1-20250805",
     };
     static const std::vector<std::string> openai = {
-        "gpt-4o",
-        "gpt-4o-mini",
-        "gpt-4.1",
-        "gpt-4.1-mini",
-        "o4-mini",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
     };
     static const std::vector<std::string> gemini = {
-        "gemini-2.0-flash",
-        "gemini-2.0-pro",
-        "gemini-1.5-pro",
-        "gemini-1.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite",
     };
-    static const std::vector<std::string> ollama = {
-        "llama3.1",
-        "llama3.2",
+    static const std::vector<std::string> llamacpp = {
+        "local-model",
         "qwen2.5-coder",
+        "llama-3.1-8b-instruct",
         "deepseek-coder-v2",
-        "mistral",
+        "mistral-7b-instruct",
     };
     switch (p) {
         case Provider::Anthropic: return anthropic;
         case Provider::OpenAI:    return openai;
         case Provider::Gemini:    return gemini;
-        case Provider::Ollama:    return ollama;
+        case Provider::Llamacpp:  return llamacpp;
     }
     return anthropic;
 }
 
 fs::path defaultConfigDir() {
-    const char* xdg = std::getenv("XDG_CONFIG_HOME");
-    if (xdg && *xdg) return fs::path(xdg) / "ovi-code";
     const char* home = std::getenv("HOME");
-    if (home && *home) return fs::path(home) / ".config" / "ovi-code";
+    if (home && *home) return fs::path(home) / ".ovi-code";
     return fs::current_path() / ".ovi-code";
 }
 
 fs::path defaultConfigPath() { return defaultConfigDir() / "config.json"; }
+
+bool migrateLegacyConfig(const fs::path& path) {
+    std::error_code ec;
+    if (fs::exists(path, ec)) return false;
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) return false;
+    fs::path legacy = fs::path(home) / ".config" / "ovi-code" / "config.json";
+    if (!fs::exists(legacy, ec)) return false;
+    fs::create_directories(path.parent_path(), ec);
+    fs::rename(legacy, path, ec);
+    if (ec) {
+        // Cross-filesystem rename can fail; fall back to copy + remove.
+        ec.clear();
+        fs::copy_file(legacy, path, fs::copy_options::overwrite_existing, ec);
+        if (ec) return false;
+        fs::remove(legacy, ec);
+    }
+    fs::permissions(path,
+                    fs::perms::owner_read | fs::perms::owner_write,
+                    fs::perm_options::replace, ec);
+    // Best-effort: drop the now-empty legacy directory.
+    fs::remove(legacy.parent_path(), ec);
+    return true;
+}
 
 std::optional<Config> loadConfig(const fs::path& path) {
     std::error_code ec;
@@ -166,6 +238,7 @@ std::optional<Config> loadConfig(const fs::path& path) {
     c.api_key = j.value("api_key", "");
     c.base_url = j.value("base_url", providerInfo(c.provider).default_base_url);
     c.technique = techniqueFromString(j.value("technique", "standard"));
+    c.theme = themeFromString(j.value("theme", "auto"));
     c.max_tool_iterations = j.value("max_tool_iterations", 12);
     c.ralph_iterations = j.value("ralph_iterations", 3);
     c.max_tokens = j.value("max_tokens", 4096);
@@ -182,6 +255,7 @@ bool saveConfig(const Config& cfg, const fs::path& path) {
         {"api_key", cfg.api_key},
         {"base_url", cfg.base_url},
         {"technique", techniqueToString(cfg.technique)},
+        {"theme", themeToString(cfg.theme)},
         {"max_tool_iterations", cfg.max_tool_iterations},
         {"ralph_iterations", cfg.ralph_iterations},
         {"max_tokens", cfg.max_tokens},

@@ -5,6 +5,8 @@
 #include <string>
 #include <thread>
 
+#include <unistd.h>
+
 #include "ovicode/agent_md.hpp"
 #include "ovicode/config.hpp"
 #include "ovicode/tui.hpp"
@@ -22,11 +24,19 @@ struct Args {
     bool show_splash = true;
 };
 
-void printSplash() {
+bool stdoutIsTty() { return isatty(STDOUT_FILENO) != 0; }
+
+bool colorAllowed() {
+    if (!stdoutIsTty()) return false;
+    const char* nc = std::getenv("NO_COLOR");
+    return !(nc && *nc);
+}
+
+void printSplash(bool with_color) {
     // ANSI Shadow block letters. Source must remain UTF-8.
-    const char* kCyan = "\033[1;36m";
-    const char* kDim  = "\033[2;36m";
-    const char* kReset = "\033[0m";
+    const char* kCyan  = with_color ? "\033[1;36m" : "";
+    const char* kDim   = with_color ? "\033[2;36m" : "";
+    const char* kReset = with_color ? "\033[0m"    : "";
     std::cout << "\n"
               << kCyan
               << "   ╔═══════════════════════════════════════════════════════════════════════╗\n"
@@ -57,7 +67,7 @@ void printHelp() {
         "  --agent-config-dir <dir>   Where to read agent.md / tools.md /\n"
         "                             skills.md from (default: workspace)\n"
         "  --config <file>            Path to ovi-code config.json\n"
-        "                             (default: ~/.config/ovi-code/config.json)\n"
+        "                             (default: ~/.ovi-code/config.json)\n"
         "  --setup                    Force the setup wizard to run\n"
         "  --no-splash                Skip the ASCII splash screen\n"
         "  -h, --help                 Show this help\n"
@@ -110,14 +120,15 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (args.show_splash) {
-        printSplash();
+    if (args.show_splash && stdoutIsTty()) {
+        printSplash(colorAllowed());
     }
 
     std::error_code ec;
     args.workspace = fs::absolute(args.workspace, ec);
     args.agent_config_dir = fs::absolute(args.agent_config_dir, ec);
 
+    ovicode::migrateLegacyConfig(args.config_path);
     auto maybe_cfg = ovicode::loadConfig(args.config_path);
     ovicode::Config cfg = maybe_cfg.value_or(ovicode::Config{});
 

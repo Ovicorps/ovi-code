@@ -26,12 +26,111 @@ using namespace ftxui;
 
 namespace {
 
-// FTXUI v5 has no Event::CtrlX named constants. Ctrl+letter is the
-// corresponding control character (A=1, …, Z=26) wrapped in Event::Special.
-const Event kCtrlL = Event::Special({0x0c});
-const Event kCtrlQ = Event::Special({0x11});
-const Event kCtrlS = Event::Special({0x13});
-const Event kCtrlT = Event::Special({0x14});
+// Chat screen uses a vim-style modal model: Insert mode types into the
+// prompt, Normal mode (after Esc) dispatches single-key commands. We avoid
+// Ctrl+S / Ctrl+Q entirely — those collide with terminal XON/XOFF flow
+// control on many setups (the prompt would silently freeze).
+enum class ChatMode { Insert, Normal };
+
+// ---- Theme / palette ----------------------------------------------------
+//
+// Every Color::* reference in the TUI is routed through Palette so we get
+// consistent contrast on both dark and light terminals. Auto-detection
+// reads $COLORFGBG (set by xterm-flavored emulators, iTerm2, kitty,
+// alacritty, wezterm); when absent we default to Dark. Users can override
+// permanently via the settings screen.
+struct Palette {
+    Color border;
+    Color accent;          // app name, prompt glyph (neutral)
+    Color muted;           // dim status text (provider / model)
+    Color insert_mode;     // -- INSERT -- tag, prompt glyph in Insert
+    Color normal_mode;     // -- NORMAL -- tag, prompt glyph in Normal
+    Color busy;            // "thinking…"
+    Color ready;           // "ready"
+    Color technique;       // technique label in header
+    Color user_entry;
+    Color assistant_entry;
+    Color tool_call;
+    Color tool_result;
+    Color system_entry;
+    Color error;
+    Color logo;
+    Color logo_subtitle;
+};
+
+Palette darkPalette() {
+    return Palette{
+        /*border         */ Color::GrayDark,
+        /*accent         */ Color::CyanLight,
+        /*muted          */ Color::GrayLight,
+        /*insert_mode    */ Color::GreenLight,
+        /*normal_mode    */ Color::YellowLight,
+        /*busy           */ Color::YellowLight,
+        /*ready          */ Color::GrayLight,
+        /*technique      */ Color::MagentaLight,
+        /*user_entry     */ Color::YellowLight,
+        /*assistant_entry*/ Color::GreenLight,
+        /*tool_call      */ Color::CyanLight,
+        /*tool_result    */ Color::BlueLight,
+        /*system_entry   */ Color::MagentaLight,
+        /*error          */ Color::RedLight,
+        /*logo           */ Color::CyanLight,
+        /*logo_subtitle  */ Color::GrayLight,
+    };
+}
+
+Palette lightPalette() {
+    // Light terminals: the bright/“Light” FTXUI variants wash out against a
+    // white background. Use the saturated base colors plus dark gray for
+    // muted text — these stay readable on Solarized Light, Apple Light, etc.
+    return Palette{
+        /*border         */ Color::GrayLight,
+        /*accent         */ Color::Blue,
+        /*muted          */ Color::GrayDark,
+        /*insert_mode    */ Color::Green,
+        /*normal_mode    */ Color::Red,
+        /*busy           */ Color::Magenta,
+        /*ready          */ Color::GrayDark,
+        /*technique      */ Color::Magenta,
+        /*user_entry     */ Color::Magenta,
+        /*assistant_entry*/ Color::Green,
+        /*tool_call      */ Color::Blue,
+        /*tool_result    */ Color::Cyan,
+        /*system_entry   */ Color::GrayDark,
+        /*error          */ Color::Red,
+        /*logo           */ Color::Blue,
+        /*logo_subtitle  */ Color::GrayDark,
+    };
+}
+
+// COLORFGBG is "fg;bg" or "fg;default;bg". Background index <= 6 means a
+// dark terminal, >= 7 means light. (rxvt sometimes emits "default" — we
+// then assume dark.)
+bool detectDarkBackground() {
+    const char* v = std::getenv("COLORFGBG");
+    if (!v || !*v) return true;
+    std::string s = v;
+    auto last = s.find_last_of(';');
+    if (last == std::string::npos) return true;
+    std::string bg = s.substr(last + 1);
+    try {
+        int n = std::stoi(bg);
+        return n < 7;
+    } catch (...) {
+        return true;
+    }
+}
+
+const Palette& palette(Theme t) {
+    static const Palette dark  = darkPalette();
+    static const Palette light = lightPalette();
+    switch (t) {
+        case Theme::Dark:  return dark;
+        case Theme::Light: return light;
+        case Theme::Auto:  return detectDarkBackground() ? dark : light;
+    }
+    return dark;
+}
 
 std::vector<std::string> providerLabels() {
     std::vector<std::string> out;
@@ -71,11 +170,24 @@ int indexOfModel(const std::vector<std::string>& models,
     return 0;
 }
 
-Element banner(const std::string& title) {
+Element banner(const Palette& pal, const std::string& title) {
     return vbox({
         text("┌─ ovi-code ─ " + title + " " +
              std::string(40, '-')) |
-            color(Color::Cyan),
+            color(pal.accent),
+    });
+}
+
+Element splashLogo(const Palette& pal) {
+    return vbox({
+        text("    ██████╗ ██╗   ██╗██╗       ██████╗ ██████╗ ██████╗ ███████╗") | color(pal.logo),
+        text("   ██╔═══██╗██║   ██║██║      ██╔════╝██╔═══██╗██╔══██╗██╔════╝") | color(pal.logo),
+        text("   ██║   ██║██║   ██║██║█████╗██║     ██║   ██║██║  ██║█████╗  ") | color(pal.logo),
+        text("   ██║   ██║╚██╗ ██╔╝██║╚════╝██║     ██║   ██║██║  ██║██╔══╝  ") | color(pal.logo),
+        text("   ╚██████╔╝ ╚████╔╝ ██║      ╚██████╗╚██████╔╝██████╔╝███████╗") | color(pal.logo),
+        text("    ╚═════╝   ╚═══╝  ╚═╝       ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝") | color(pal.logo),
+        text("         Read · Edit · Reason · Refactor · Run") |
+            color(pal.logo_subtitle) | dim,
     });
 }
 
@@ -166,10 +278,11 @@ bool runSetupWizard(Config& cfg) {
     auto root = Container::Vertical({layout, buttons});
 
     auto renderer = Renderer(root, [&] {
+        const Palette& pal = palette(cfg.theme);
         Element body;
         if (step == 0) {
             body = vbox({
-                text("1. Choose your LLM provider:") | bold,
+                text("1. Choose your LLM provider:") | bold | color(pal.accent),
                 separator(),
                 provider_menu->Render() | frame |
                     size(HEIGHT, LESS_THAN, 12),
@@ -177,20 +290,22 @@ bool runSetupWizard(Config& cfg) {
         } else if (step == 1) {
             const auto& info = knownProviders()[provider_idx];
             body = vbox({
-                text("2. " + info.label + " — API key") | bold,
+                text("2. " + info.label + " — API key") | bold |
+                    color(pal.accent),
                 separator(),
                 hbox({text("API key: "), key_input->Render()}),
                 text(""),
                 hbox({text("Base URL: "), url_input->Render()}),
                 text(""),
                 paragraph(
-                    "Your key is saved to ~/.config/ovi-code/config.json "
+                    "Your key is saved to ~/.ovi-code/config.json "
                     "with 0600 permissions. Leave blank to skip if you set "
-                    "the key via an environment variable."),
+                    "the key via an environment variable.") |
+                    color(pal.muted),
             });
         } else if (step == 2) {
             body = vbox({
-                text("3. Choose a model") | bold,
+                text("3. Choose a model") | bold | color(pal.accent),
                 separator(),
                 model_menu->Render() | frame |
                     size(HEIGHT, LESS_THAN, 10),
@@ -201,18 +316,20 @@ bool runSetupWizard(Config& cfg) {
             });
         } else {
             body = vbox({
-                text("4. Choose default agentic technique") | bold,
+                text("4. Choose default agentic technique") | bold |
+                    color(pal.accent),
                 separator(),
                 technique_menu->Render() | frame |
                     size(HEIGHT, LESS_THAN, 12),
                 text(""),
                 paragraph(
-                    "You can switch techniques any time from the chat screen "
-                    "with Ctrl+T."),
+                    "You can switch techniques any time from the chat "
+                    "screen via Normal mode (Esc, then t).") |
+                    color(pal.muted),
             });
         }
         return vbox({
-            banner("setup"),
+            banner(pal, "setup"),
             text(""),
             body,
             text(""),
@@ -226,7 +343,7 @@ bool runSetupWizard(Config& cfg) {
                 filler(),
                 text("step " + std::to_string(step + 1) + "/4") | dim,
             }),
-        }) | border;
+        }) | border | color(pal.border);
     });
 
     screen.Loop(renderer);
@@ -260,6 +377,13 @@ bool runSettingsScreen(Config& cfg) {
 
     int provider_idx = indexOfProvider(cfg.provider);
     int technique_idx = indexOfTechnique(cfg.technique);
+    int theme_idx = 0;
+    {
+        const auto& list = allThemes();
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (list[i] == cfg.theme) { theme_idx = static_cast<int>(i); break; }
+        }
+    }
     std::string api_key = cfg.api_key;
     std::string base_url = cfg.base_url;
     std::string model = cfg.model;
@@ -272,6 +396,12 @@ bool runSettingsScreen(Config& cfg) {
 
     auto technique_choices = techniqueLabels();
     auto technique_menu = Menu(&technique_choices, &technique_idx);
+
+    std::vector<std::string> theme_choices;
+    for (auto t : allThemes()) {
+        theme_choices.push_back(themeLabel(t) + " — " + themeDescription(t));
+    }
+    auto theme_menu = Menu(&theme_choices, &theme_idx);
 
     std::vector<std::string> model_choices = knownModels(cfg.provider);
     model_choices.push_back("(custom — type below)");
@@ -298,6 +428,10 @@ bool runSettingsScreen(Config& cfg) {
         cfg.api_key = api_key;
         cfg.base_url = base_url;
         cfg.technique = allTechniques()[technique_idx];
+        if (theme_idx >= 0 &&
+            theme_idx < static_cast<int>(allThemes().size())) {
+            cfg.theme = allThemes()[theme_idx];
+        }
         try {
             cfg.max_tool_iterations = std::max(1, std::stoi(max_iters_s));
         } catch (...) {
@@ -336,6 +470,7 @@ bool runSettingsScreen(Config& cfg) {
         key_input,
         url_input,
         technique_menu,
+        theme_menu,
         iters_input,
         ralph_input,
         temp_input,
@@ -343,33 +478,38 @@ bool runSettingsScreen(Config& cfg) {
     });
 
     auto renderer = Renderer(layout, [&] {
+        const Palette& pal = palette(cfg.theme);
         return vbox({
-            banner("settings"),
+            banner(pal, "settings"),
             text(""),
             hbox({
                 vbox({
-                    text("Provider") | bold,
+                    text("Provider") | bold | color(pal.accent),
                     provider_menu->Render() | frame |
                         size(HEIGHT, LESS_THAN, 6),
                     text(""),
                     refresh_button->Render(),
                     text(""),
-                    text("Model") | bold,
+                    text("Model") | bold | color(pal.accent),
                     model_menu->Render() | frame |
                         size(HEIGHT, LESS_THAN, 6),
                     hbox({text("Custom: "), model_input->Render()}),
                 }) | flex,
                 separator(),
                 vbox({
-                    text("API key") | bold,
+                    text("API key") | bold | color(pal.accent),
                     key_input->Render(),
                     text(""),
-                    text("Base URL") | bold,
+                    text("Base URL") | bold | color(pal.accent),
                     url_input->Render(),
                     text(""),
-                    text("Technique") | bold,
+                    text("Technique") | bold | color(pal.accent),
                     technique_menu->Render() | frame |
                         size(HEIGHT, LESS_THAN, 6),
+                    text(""),
+                    text("Theme") | bold | color(pal.accent),
+                    theme_menu->Render() | frame |
+                        size(HEIGHT, LESS_THAN, 5),
                     text(""),
                     hbox({text("Max tool iters: "), iters_input->Render()}),
                     hbox({text("Ralph iters:    "), ralph_input->Render()}),
@@ -384,7 +524,7 @@ bool runSettingsScreen(Config& cfg) {
                 filler(),
                 text("ESC = cancel") | dim,
             }),
-        }) | border;
+        }) | border | color(pal.border);
     });
 
     auto with_escape = CatchEvent(renderer, [&](Event e) {
@@ -407,14 +547,14 @@ bool runSettingsScreen(Config& cfg) {
 
 namespace {
 
-Color kindColor(TranscriptEntry::Kind k) {
+Color kindColor(const Palette& pal, TranscriptEntry::Kind k) {
     switch (k) {
-        case TranscriptEntry::Kind::User:       return Color::Yellow;
-        case TranscriptEntry::Kind::Assistant:  return Color::Green;
-        case TranscriptEntry::Kind::ToolCall:   return Color::Cyan;
-        case TranscriptEntry::Kind::ToolResult: return Color::Blue;
-        case TranscriptEntry::Kind::System:     return Color::Magenta;
-        case TranscriptEntry::Kind::Error:      return Color::Red;
+        case TranscriptEntry::Kind::User:       return pal.user_entry;
+        case TranscriptEntry::Kind::Assistant:  return pal.assistant_entry;
+        case TranscriptEntry::Kind::ToolCall:   return pal.tool_call;
+        case TranscriptEntry::Kind::ToolResult: return pal.tool_result;
+        case TranscriptEntry::Kind::System:     return pal.system_entry;
+        case TranscriptEntry::Kind::Error:      return pal.error;
     }
     return Color::Default;
 }
@@ -431,10 +571,10 @@ const char* kindLabel(TranscriptEntry::Kind k) {
     return "?";
 }
 
-Element renderEntry(const TranscriptEntry& e) {
+Element renderEntry(const Palette& pal, const TranscriptEntry& e) {
     auto header = text(std::string("● ") + kindLabel(e.kind) +
                        (e.title.empty() ? "" : " · " + e.title)) |
-                  color(kindColor(e.kind)) | bold;
+                  color(kindColor(pal, e.kind)) | bold;
     std::vector<Element> body_lines;
     std::istringstream is(e.body);
     std::string line;
@@ -464,18 +604,44 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     std::string input_value;
     std::thread worker;
 
-    transcript.push_back({TranscriptEntry::Kind::System, "welcome",
-                          std::string("Workspace: ") + workspace.string() +
-                              "  ·  Provider: " + providerLabel(cfg.provider) +
-                              "  ·  Model: " + cfg.model +
-                              "  ·  Technique: " + techniqueLabel(cfg.technique)});
-    transcript.push_back(
-        {TranscriptEntry::Kind::System, "hints",
-         "Enter = send  ·  Ctrl+S = settings  ·  Ctrl+T = cycle technique  "
-         "·  Ctrl+L = clear  ·  Ctrl+Q = quit"});
+    // Cap transcript memory + per-frame render cost. When we exceed the
+    // hard cap, trim back to the keep target in one shot to amortize the
+    // vector::erase. Caller must hold `mu`.
+    constexpr size_t kTranscriptHardCap = 1000;
+    constexpr size_t kTranscriptKeep    = 900;
+    auto pushEntryLocked = [&](TranscriptEntry e) {
+        transcript.push_back(std::move(e));
+        if (transcript.size() > kTranscriptHardCap) {
+            size_t drop = transcript.size() - kTranscriptKeep;
+            transcript.erase(transcript.begin(),
+                             transcript.begin() + drop);
+            transcript.insert(
+                transcript.begin(),
+                TranscriptEntry{TranscriptEntry::Kind::System, "elided",
+                                std::string("(") + std::to_string(drop) +
+                                    " earlier entries dropped to keep the "
+                                    "transcript bounded)"});
+        }
+    };
+
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        pushEntryLocked({TranscriptEntry::Kind::System, "welcome",
+                         std::string("Workspace: ") + workspace.string() +
+                             "  ·  Provider: " + providerLabel(cfg.provider) +
+                             "  ·  Model: " + cfg.model +
+                             "  ·  Technique: " +
+                             techniqueLabel(cfg.technique)});
+        pushEntryLocked(
+            {TranscriptEntry::Kind::System, "hints",
+             "Insert mode (default): type, Enter sends, Esc → Normal mode.  "
+             "Normal mode: i/a/Enter insert · q quit · s settings · t "
+             "technique · c clear."});
+    }
 
     enum class Next { Quit, OpenSettings };
     Next next = Next::Quit;
+    ChatMode mode = ChatMode::Insert;
 
     while (true) {
     auto screen = ScreenInteractive::Fullscreen();
@@ -493,7 +659,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                     [&](const TranscriptEntry& e) {
                         {
                             std::lock_guard<std::mutex> lk(mu);
-                            transcript.push_back(e);
+                            pushEntryLocked(e);
                         }
                         screen.PostEvent(Event::Custom);
                         return !stop_requested.load();
@@ -503,44 +669,61 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         });
     };
 
+    auto cycle_technique = [&] {
+        const auto& list = allTechniques();
+        int idx = indexOfTechnique(cfg.technique);
+        cfg.technique = list[(idx + 1) % list.size()];
+        std::lock_guard<std::mutex> lk(mu);
+        pushEntryLocked(
+            {TranscriptEntry::Kind::System, "technique",
+             std::string("Switched to ") + techniqueLabel(cfg.technique)});
+    };
+    auto open_settings = [&] {
+        if (busy.load()) {
+            std::lock_guard<std::mutex> lk(mu);
+            pushEntryLocked(
+                {TranscriptEntry::Kind::System, "settings",
+                 "Cannot open settings while a turn is in progress."});
+            return;
+        }
+        next = Next::OpenSettings;
+        screen.ExitLoopClosure()();
+    };
+    auto clear_transcript = [&] {
+        std::lock_guard<std::mutex> lk(mu);
+        transcript.clear();
+    };
+
     auto input_with_events = CatchEvent(input, [&](Event e) {
+        if (mode == ChatMode::Normal) {
+            // Single-letter commands; swallow every other key so the input
+            // stays untouched while in Normal mode.
+            if (e == Event::Character("i") || e == Event::Character("a") ||
+                e == Event::Return) {
+                mode = ChatMode::Insert;
+                return true;
+            }
+            if (e == Event::Character("q")) {
+                next = Next::Quit;
+                screen.ExitLoopClosure()();
+                return true;
+            }
+            if (e == Event::Character("s")) { open_settings();     return true; }
+            if (e == Event::Character("t")) { cycle_technique();   return true; }
+            if (e == Event::Character("c")) { clear_transcript();  return true; }
+            return true;  // eat the event regardless
+        }
+
+        // Insert mode.
+        if (e == Event::Escape) {
+            mode = ChatMode::Normal;
+            return true;
+        }
         if (e == Event::Return) {
             if (busy.load() || input_value.empty()) return true;
             auto p = input_value;
             input_value.clear();
             send_turn(p);
-            return true;
-        }
-        if (e == kCtrlQ) {
-            next = Next::Quit;
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        if (e == kCtrlL) {
-            std::lock_guard<std::mutex> lk(mu);
-            transcript.clear();
-            return true;
-        }
-        if (e == kCtrlT) {
-            const auto& list = allTechniques();
-            int idx = indexOfTechnique(cfg.technique);
-            cfg.technique = list[(idx + 1) % list.size()];
-            std::lock_guard<std::mutex> lk(mu);
-            transcript.push_back(
-                {TranscriptEntry::Kind::System, "technique",
-                 std::string("Switched to ") + techniqueLabel(cfg.technique)});
-            return true;
-        }
-        if (e == kCtrlS) {
-            if (busy.load()) {
-                std::lock_guard<std::mutex> lk(mu);
-                transcript.push_back(
-                    {TranscriptEntry::Kind::System, "settings",
-                     "Cannot open settings while a turn is in progress."});
-                return true;
-            }
-            next = Next::OpenSettings;
-            screen.ExitLoopClosure()();
             return true;
         }
         return false;
@@ -549,42 +732,60 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     auto root = Container::Vertical({input_with_events});
 
     auto renderer = Renderer(root, [&] {
+        const Palette& pal = palette(cfg.theme);
+        bool wide_enough = Terminal::Size().dimx >= 72;
+
         std::vector<Element> rendered;
         {
             std::lock_guard<std::mutex> lk(mu);
-            for (const auto& e : transcript) rendered.push_back(renderEntry(e));
+            rendered.reserve(transcript.size());
+            for (const auto& e : transcript)
+                rendered.push_back(renderEntry(pal, e));
         }
         if (rendered.empty()) rendered.push_back(text(""));
         Element scroll =
             vbox(rendered) | yframe | focusPositionRelative(0.f, 1.f) | yflex;
 
         std::string status = busy.load() ? " thinking… " : " ready ";
-        Color status_color = busy.load() ? Color::Yellow : Color::GrayLight;
+        Color status_color = busy.load() ? pal.busy : pal.ready;
+        bool insert = (mode == ChatMode::Insert);
+        std::string mode_tag = insert ? " -- INSERT -- " : " -- NORMAL -- ";
+        Color mode_color = insert ? pal.insert_mode : pal.normal_mode;
+        const char* prompt_glyph = insert ? "> " : ": ";
 
-        return vbox({
-                   hbox({
-                       text("ovi-code") | bold | color(Color::Cyan),
-                       text("  "),
-                       text(providerLabel(cfg.provider)) | color(Color::GrayLight),
-                       text(" · "),
-                       text(cfg.model) | color(Color::GrayLight),
-                       text(" · "),
-                       text(techniqueLabel(cfg.technique)) |
-                           color(Color::Magenta),
-                       filler(),
-                       text(status) | color(status_color) | bold,
-                   }) |
-                       borderRounded,
-                   scroll | border | flex,
-                   hbox({
-                       text("> ") | color(Color::Cyan),
-                       input->Render() | flex,
-                   }) | border,
-                   text("Enter send · Ctrl+S settings · Ctrl+T technique "
-                        "· Ctrl+L clear · Ctrl+Q quit") |
-                       dim | center,
-               }) |
-               flex;
+        std::string footer =
+            insert
+                ? "INSERT  ·  Enter send  ·  Esc → Normal mode"
+                : "NORMAL  ·  i/a/Enter insert  ·  q quit  ·  s settings  "
+                  "·  t technique  ·  c clear";
+
+        std::vector<Element> rows;
+        if (wide_enough) rows.push_back(splashLogo(pal) | center);
+        rows.push_back(
+            hbox({
+                text("ovi-code") | bold | color(pal.accent),
+                text("  "),
+                text(providerLabel(cfg.provider)) | color(pal.muted),
+                text(" · "),
+                text(cfg.model) | color(pal.muted),
+                text(" · "),
+                text(techniqueLabel(cfg.technique)) | color(pal.technique),
+                filler(),
+                text(mode_tag) | color(mode_color) | bold,
+                text(" "),
+                text(status) | color(status_color) | bold,
+            }) |
+            borderRounded | color(pal.border));
+        rows.push_back(scroll | border | color(pal.border) | flex);
+        rows.push_back(
+            hbox({
+                text(prompt_glyph) | color(mode_color),
+                input->Render() | flex,
+            }) |
+            border | color(pal.border));
+        rows.push_back(text(footer) | color(pal.muted) | dim | center);
+
+        return vbox(std::move(rows)) | flex;
     });
 
     screen.Loop(renderer);
@@ -596,7 +797,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     if (next == Next::OpenSettings) {
         runSettingsScreen(cfg);
         std::lock_guard<std::mutex> lk(mu);
-        transcript.push_back(
+        pushEntryLocked(
             {TranscriptEntry::Kind::System, "settings",
              std::string("Now using ") + providerLabel(cfg.provider) + " / " +
                  cfg.model + " / " + techniqueLabel(cfg.technique)});
