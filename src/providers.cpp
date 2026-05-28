@@ -429,10 +429,16 @@ ChatResponse callGemini(const Config& cfg, const ChatRequest& req) {
                 json parts = json::array();
                 if (!m.text.empty()) parts.push_back({{"text", m.text}});
                 for (const auto& tc : m.tool_calls) {
-                    parts.push_back({{"functionCall", {
+                    json part = {{"functionCall", {
                         {"name", tc.name},
                         {"args", tc.input.is_null() ? json::object() : tc.input},
-                    }}});
+                    }}};
+                    // Gemini requires thoughtSignature to be replayed on every
+                    // functionCall part when thinking is enabled on the model.
+                    if (!tc.thought_signature.empty()) {
+                        part["thoughtSignature"] = tc.thought_signature;
+                    }
+                    parts.push_back(std::move(part));
                 }
                 if (parts.empty()) parts.push_back({{"text", ""}});
                 contents.push_back({{"role", "model"}, {"parts", parts}});
@@ -518,6 +524,11 @@ ChatResponse callGemini(const Config& cfg, const ChatRequest& req) {
                 tc.id = genId("call");
                 tc.name = fc.value("name", "");
                 tc.input = fc.value("args", json::object());
+                if (part.contains("thoughtSignature") &&
+                    part["thoughtSignature"].is_string()) {
+                    tc.thought_signature =
+                        part["thoughtSignature"].get<std::string>();
+                }
                 out.tool_calls.push_back(std::move(tc));
             }
         }
