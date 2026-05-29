@@ -249,11 +249,21 @@ Element banner(const Palette& pal, const std::string& title) {
     });
 }
 
+// Wipe the terminal (visible area + scrollback) and home the cursor before a
+// non-fullscreen FTXUI screen draws its first frame. Without this the wizard
+// and settings views render below whatever shell output preceded them, which
+// looks like leftover clutter from a previous session.
+void clearTerminal() {
+    std::fputs("\x1b[3J\x1b[2J\x1b[H", stdout);
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 // -- Setup wizard -----------------------------------------------------------
 
 bool runSetupWizard(Config& cfg) {
+    clearTerminal();
     auto screen = ScreenInteractive::TerminalOutput();
 
     int step = 0;  // 0=provider, 1=key, 2=model, 3=technique
@@ -429,6 +439,7 @@ bool runSetupWizard(Config& cfg) {
 // -- Settings screen --------------------------------------------------------
 
 bool runSettingsScreen(Config& cfg) {
+    clearTerminal();
     auto screen = ScreenInteractive::TerminalOutput();
     bool changed = false;
     bool keep_going = true;
@@ -893,6 +904,18 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     // the output area takes the whole screen while the prompt buffer is kept.
     bool input_minimized = false;
 
+    // Which panel has keyboard control. Ctrl+W toggles it (NORMAL mode only).
+    // When the output panel is focused, j/k scroll it; while the input panel
+    // is focused the output auto-follows the latest entry (pinned to bottom).
+    enum class FocusTarget { Input, Output };
+    FocusTarget focus_target = FocusTarget::Input;
+    // Relative scroll position of the output frame, 0 = top, 1 = bottom.
+    float output_scroll = 1.f;
+    constexpr float kScrollStep = 0.05f;
+    // Ctrl+W = byte 0x17 (W is the 23rd letter). FTXUI has no Ctrl+letter
+    // named constants, so build it from the raw control byte.
+    const Event kCtrlW = Event::Special({23});
+
     // Cap transcript memory + per-frame render cost.
     constexpr size_t kTranscriptHardCap = 1000;
     constexpr size_t kTranscriptKeep    = 900;
@@ -924,7 +947,8 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
              "INSERT: type freely · Enter = newline · Esc → NORMAL.   "
              "NORMAL: Enter sends · h j k l move · w b word · 0 $ line · "
              "gg G top/bot · i a o O I A insert · x delete · dd cut line · "
-             "q quit · s settings · t technique · c clear · z toggle min."});
+             "Ctrl+W focus output (j/k scroll) · q quit · s settings · "
+             "t technique · c clear · z toggle min."});
     }
 
     enum class Next { Quit, OpenSettings };
@@ -1028,6 +1052,45 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         }
 
         // ---- Normal mode ----
+        // When control is on the output panel, j/k scroll it and the editing
+        // motions are suspended. Ctrl+W hands control back to the input panel.
+        // App commands (q/s/t/c/z) stay live so they work from either panel.
+        if (focus_target == FocusTarget::Output) {
+            if (e == kCtrlW) {
+                focus_target = FocusTarget::Input;
+                return true;
+            }
+            if (e == Event::Character("j") || e == Event::ArrowDown) {
+                output_scroll = std::min(1.f, output_scroll + kScrollStep);
+                return true;
+            }
+            if (e == Event::Character("k") || e == Event::ArrowUp) {
+                output_scroll = std::max(0.f, output_scroll - kScrollStep);
+                return true;
+            }
+            if (e == Event::Character("g")) { output_scroll = 0.f; return true; }
+            if (e == Event::Character("G")) { output_scroll = 1.f; return true; }
+            if (e == Event::Character("q")) {
+                next = Next::Quit;
+                screen.ExitLoopClosure()();
+                return true;
+            }
+            if (e == Event::Character("s")) { open_settings();   return true; }
+            if (e == Event::Character("t")) { cycle_technique(); return true; }
+            if (e == Event::Character("c")) { clear_transcript(); return true; }
+            if (e == Event::Character("z")) {
+                input_minimized = !input_minimized;
+                return true;
+            }
+            return true;  // swallow everything else while scrolling
+        }
+
+        // Ctrl+W hands keyboard control to the output panel for scrolling.
+        if (e == kCtrlW) {
+            focus_target = FocusTarget::Output;
+            return true;
+        }
+
         // Two-key motions: pending_op stores the leader.
         if (!editor.pending_op.empty()) {
             std::string op = editor.pending_op;
@@ -1124,9 +1187,16 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                 rendered.push_back(renderEntry(pal, e));
         }
         if (rendered.empty()) rendered.push_back(text(""));
-        // Pin to bottom so new output is always visible.
+        bool output_focused = (focus_target == FocusTarget::Output);
+        // While the input panel is focused the output auto-follows the latest
+        // entry (pinned to the bottom). When the output panel is focused the
+        // user drives the scroll position with j/k. The focusPositionRelative
+        // must sit *inside* the frame — `| yframe` applied last would wrap the
+        // frame instead, leaving it with no focused child to scroll to (it
+        // would stay stuck at the top).
+        float scroll_y = output_focused ? output_scroll : 1.f;
         Element scroll =
-            vbox(rendered) | yframe | focusPositionRelative(0.f, 1.f);
+            vbox(rendered) | focusPositionRelative(0.f, scroll_y) | yframe;
 
         std::string status = busy.load() ? " thinking… " : " ready ";
         Color status_color = busy.load() ? pal.busy : pal.ready;
@@ -1137,8 +1207,11 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         std::string footer =
             insert
                 ? "INSERT  ·  Enter newline  ·  Esc → NORMAL"
+                : output_focused
+                ? "OUTPUT  ·  j k scroll  ·  g G top/bottom  ·  Ctrl+W → input"
                 : "NORMAL  ·  Enter send  ·  h j k l move  ·  w b word  ·  "
-                  "i a o O I A insert  ·  x dd  ·  z min  ·  q s t c";
+                  "i a o O I A insert  ·  x dd  ·  z min  ·  Ctrl+W output  ·  "
+                  "q s t c";
 
         Element header_bar =
             hbox({
@@ -1157,14 +1230,18 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             borderRounded | color(pal.border);
 
         Element output_panel =
-            window(text(" output ") | color(pal.accent) | bold,
+            window(hbox({
+                       text(" output ") | color(pal.accent) | bold,
+                       text(output_focused ? "[SCROLL · j/k]" : "") |
+                           color(pal.normal_mode),
+                   }),
                    scroll) |
-            color(pal.border) | flex;
+            color(output_focused ? pal.accent : pal.border) | flex;
 
         Element input_body = input_minimized
             ? renderEditor(editor, pal, true)
-            : renderEditor(editor, pal, false) | yframe |
-                  focusPositionRelative(0.f, 1.f);
+            : renderEditor(editor, pal, false) |
+                  focusPositionRelative(0.f, 1.f) | yframe;
 
         Element input_panel =
             window(hbox({
