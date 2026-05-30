@@ -243,7 +243,7 @@ int indexOfModel(const std::vector<std::string>& models,
 
 Element banner(const Palette& pal, const std::string& title) {
     return vbox({
-        text("┌─ ovi-code ─ " + title + " " +
+        text("┌─ OVI-CODE ─ " + title + " " +
              std::string(40, '-')) |
             color(pal.accent),
     });
@@ -1215,7 +1215,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
 
         Element header_bar =
             hbox({
-                text("ovi-code") | bold | color(pal.accent),
+                text("OVI-CODE") | bold | color(pal.accent),
                 text("  "),
                 text(providerLabel(cfg.provider)) | color(pal.muted),
                 text(" · "),

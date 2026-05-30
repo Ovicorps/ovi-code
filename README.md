@@ -1,4 +1,4 @@
-# ovi-code
+# OVI-CODE
 
 A tiny code-editing TUI agent in C++ — inspired by Amp's *How to Build an
 Agent*. ReAct-style tool loop, three file tools (`read_file`, `list_files`,
@@ -33,6 +33,19 @@ cmake --build build -j
 ```
 
 The binary lands at `build/ovi-code`.
+
+## Install via Homebrew
+
+```bash
+brew install Ovicorps/ovi-code/ovi-code
+```
+
+This taps `Ovicorps/homebrew-ovi-code` and builds OVI-CODE from source
+(CMake pulls in FTXUI + nlohmann/json automatically). Bleeding edge from
+`main`: `brew install --HEAD Ovicorps/ovi-code/ovi-code`.
+
+Maintainers: see [`packaging/homebrew/README.md`](packaging/homebrew/README.md)
+for how to cut a tagged release and publish the tap.
 
 ## Running
 

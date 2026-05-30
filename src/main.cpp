@@ -58,7 +58,7 @@ void printSplash(bool with_color) {
 
 void printHelp() {
     std::cout <<
-        "ovi-code — tiny code-editing TUI agent\n"
+        "OVI-CODE — tiny code-editing TUI agent\n"
         "\n"
         "Usage: ovi-code [options]\n"
         "\n"
