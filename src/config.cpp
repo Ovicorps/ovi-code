@@ -21,6 +21,8 @@ const std::vector<ProviderInfo>& knownProviders() {
          "https://generativelanguage.googleapis.com", true},
         {Provider::Llamacpp, "Local (llama.cpp)", "local-model",
          "http://localhost:8080", false},
+        {Provider::Cerebras, "Cerebras", "gpt-oss-120b",
+         "https://api.cerebras.ai", true},
     };
     return v;
 }
@@ -40,6 +42,7 @@ std::string providerToString(Provider p) {
         case Provider::OpenAI:    return "openai";
         case Provider::Gemini:    return "gemini";
         case Provider::Llamacpp:  return "llamacpp";
+        case Provider::Cerebras:  return "cerebras";
     }
     return "anthropic";
 }
@@ -49,6 +52,7 @@ Provider providerFromString(const std::string& s) {
     if (s == "openai")    return Provider::OpenAI;
     if (s == "gemini")    return Provider::Gemini;
     if (s == "llamacpp")  return Provider::Llamacpp;
+    if (s == "cerebras")  return Provider::Cerebras;
     return Provider::Anthropic;
 }
 
@@ -187,11 +191,16 @@ const std::vector<std::string>& knownModels(Provider p) {
         "deepseek-coder-v2",
         "mistral-7b-instruct",
     };
+    static const std::vector<std::string> cerebras = {
+        "gpt-oss-120b",
+        "zai-glm-4.7",
+    };
     switch (p) {
         case Provider::Anthropic: return anthropic;
         case Provider::OpenAI:    return openai;
         case Provider::Gemini:    return gemini;
         case Provider::Llamacpp:  return llamacpp;
+        case Provider::Cerebras:  return cerebras;
     }
     return anthropic;
 }

@@ -548,6 +548,9 @@ ChatResponse chat(const Config& cfg, const ChatRequest& req) {
         case Provider::Llamacpp:
             return callOpenAICompatible(cfg, req, "llama.cpp",
                                         /*require_key=*/false);
+        case Provider::Cerebras:
+            return callOpenAICompatible(cfg, req, "Cerebras",
+                                        /*require_key=*/true);
         case Provider::Gemini:
             return callGemini(cfg, req);
     }

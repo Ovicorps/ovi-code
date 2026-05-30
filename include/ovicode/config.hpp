@@ -12,6 +12,7 @@ enum class Provider {
     OpenAI,
     Gemini,
     Llamacpp,
+    Cerebras,
 };
 
 enum class Technique {
