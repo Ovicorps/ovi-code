@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -258,6 +259,77 @@ void clearTerminal() {
     std::fflush(stdout);
 }
 
+// Shared vim-style modal wrapper for the wizard + settings screens, mirroring
+// the chat screen's NORMAL/INSERT model so the whole app navigates the same
+// way:
+//
+//   NORMAL — j/k/h/l are translated to the arrow keys, so they drive menu
+//            selection *and* move focus between fields (FTXUI Menus consume
+//            Up/Down; on plain Inputs/Buttons the arrows fall through to the
+//            container). i/a begin editing the focused Input; Enter activates
+//            a focused Button; Tab still cycles fields natively; q or Esc
+//            cancel via `on_cancel`.
+//   INSERT — keystrokes flow straight to the focused FTXUI Input; Esc returns
+//            to NORMAL.
+//
+// Every other raw character is swallowed in NORMAL so text Inputs never absorb
+// navigation keys — the same invariant the chat screen relies on. `mode` is
+// owned by the caller so its renderer can show the active mode in the footer.
+Component vimModalLayer(Component child, ChatMode& mode,
+                        std::function<void()> on_cancel) {
+    return CatchEvent(
+        child, [child, &mode, on_cancel = std::move(on_cancel)](Event e) {
+            if (mode == ChatMode::Insert) {
+                if (e == Event::Escape) {
+                    mode = ChatMode::Normal;
+                    return true;
+                }
+                return false;  // typing flows to the focused Input
+            }
+            // ---- NORMAL mode ----
+            if (e == Event::Escape || e == Event::Character("q")) {
+                on_cancel();
+                return true;
+            }
+            if (e == Event::Character("i") || e == Event::Character("a")) {
+                mode = ChatMode::Insert;
+                return true;
+            }
+            if (e == Event::Character("j")) {
+                child->OnEvent(Event::ArrowDown);
+                return true;
+            }
+            if (e == Event::Character("k")) {
+                child->OnEvent(Event::ArrowUp);
+                return true;
+            }
+            if (e == Event::Character("h")) {
+                child->OnEvent(Event::ArrowLeft);
+                return true;
+            }
+            if (e == Event::Character("l")) {
+                child->OnEvent(Event::ArrowRight);
+                return true;
+            }
+            // Swallow any other raw character so focused Inputs stay inert in
+            // NORMAL; arrows / Tab / Enter still reach the components natively.
+            if (e.is_character()) return true;
+            return false;
+        });
+}
+
+// FTXUI's Input paints a blinking *bar* cursor when focused (it hard-codes
+// `focusCursorBarBlinking`). We want a rectangle everywhere — matching the
+// block cursor the chat editor draws with an `inverted` cell — so override the
+// focused input's shape to a steady block. Only the *focused* input is wrapped:
+// FocusCursor::Render sets the terminal cursor unconditionally, so wrapping
+// every input would pin the cursor to whichever one renders last instead of
+// the one being edited.
+Element blockCursorInput(const Component& input) {
+    Element e = input->Render();
+    return input->Focused() ? focusCursorBlock(std::move(e)) : e;
+}
+
 }  // namespace
 
 // -- Setup wizard -----------------------------------------------------------
@@ -275,6 +347,8 @@ bool runSetupWizard(Config& cfg) {
     int model_idx = 0;
     bool aborted = false;
     bool finished = false;
+    // Start in NORMAL so j/k drive the menus immediately; i/a edits inputs.
+    ChatMode mode = ChatMode::Normal;
 
     auto provider_choices = providerLabels();
     auto technique_choices = techniqueLabels();
@@ -361,9 +435,9 @@ bool runSetupWizard(Config& cfg) {
                 text("2. " + info.label + " — API key") | bold |
                     color(pal.accent),
                 separator(),
-                hbox({text("API key: "), key_input->Render()}),
+                hbox({text("API key: "), blockCursorInput(key_input)}),
                 text(""),
-                hbox({text("Base URL: "), url_input->Render()}),
+                hbox({text("Base URL: "), blockCursorInput(url_input)}),
                 text(""),
                 paragraph(
                     "Your key is saved to ~/.ovi-code/config.json "
@@ -378,9 +452,9 @@ bool runSetupWizard(Config& cfg) {
                 model_menu->Render() | frame |
                     size(HEIGHT, LESS_THAN, 10),
                 text(""),
-                hbox({text("Custom model: "), model_input->Render()}),
+                hbox({text("Custom model: "), blockCursorInput(model_input)}),
                 text(""),
-                hbox({text("Base URL:     "), url_input->Render()}),
+                hbox({text("Base URL:     "), blockCursorInput(url_input)}),
             });
         } else {
             body = vbox({
@@ -409,12 +483,27 @@ bool runSetupWizard(Config& cfg) {
                 text("  "),
                 cancel_button->Render(),
                 filler(),
+                text(mode == ChatMode::Insert ? " -- INSERT -- "
+                                              : " -- NORMAL -- ") |
+                    color(mode == ChatMode::Insert ? pal.insert_mode
+                                                   : pal.normal_mode) |
+                    bold,
+                text("  "),
                 text("step " + std::to_string(step + 1) + "/4") | dim,
             }),
+            text(mode == ChatMode::Insert
+                     ? "INSERT · type · Esc → NORMAL"
+                     : "NORMAL · j k move · Tab field · i a edit · "
+                       "Enter select · q cancel") |
+                color(pal.muted) | dim | center,
         }) | border | color(pal.border);
     });
 
-    screen.Loop(renderer);
+    auto modal = vimModalLayer(renderer, mode, [&] {
+        aborted = true;
+        screen.ExitLoopClosure()();
+    });
+    screen.Loop(modal);
 
     if (aborted) return false;
     if (!finished) return false;
@@ -443,6 +532,8 @@ bool runSettingsScreen(Config& cfg) {
     auto screen = ScreenInteractive::TerminalOutput();
     bool changed = false;
     bool keep_going = true;
+    // Start in NORMAL so j/k navigate the form; i/a edits the focused input.
+    ChatMode mode = ChatMode::Normal;
 
     int provider_idx = indexOfProvider(cfg.provider);
     int technique_idx = indexOfTechnique(cfg.technique);
@@ -562,15 +653,15 @@ bool runSettingsScreen(Config& cfg) {
                     text("Model") | bold | color(pal.accent),
                     model_menu->Render() | frame |
                         size(HEIGHT, LESS_THAN, 6),
-                    hbox({text("Custom: "), model_input->Render()}),
+                    hbox({text("Custom: "), blockCursorInput(model_input)}),
                 }) | flex,
                 separator(),
                 vbox({
                     text("API key") | bold | color(pal.accent),
-                    key_input->Render(),
+                    blockCursorInput(key_input),
                     text(""),
                     text("Base URL") | bold | color(pal.accent),
-                    url_input->Render(),
+                    blockCursorInput(url_input),
                     text(""),
                     text("Technique") | bold | color(pal.accent),
                     technique_menu->Render() | frame |
@@ -580,9 +671,9 @@ bool runSettingsScreen(Config& cfg) {
                     theme_menu->Render() | frame |
                         size(HEIGHT, LESS_THAN, 5),
                     text(""),
-                    hbox({text("Max tool iters: "), iters_input->Render()}),
-                    hbox({text("Ralph iters:    "), ralph_input->Render()}),
-                    hbox({text("Temperature:    "), temp_input->Render()}),
+                    hbox({text("Max tool iters: "), blockCursorInput(iters_input)}),
+                    hbox({text("Ralph iters:    "), blockCursorInput(ralph_input)}),
+                    hbox({text("Temperature:    "), blockCursorInput(temp_input)}),
                 }) | flex,
             }),
             separator(),
@@ -591,22 +682,27 @@ bool runSettingsScreen(Config& cfg) {
                 text("  "),
                 cancel_button->Render(),
                 filler(),
-                text("ESC = cancel") | dim,
+                text(mode == ChatMode::Insert ? " -- INSERT -- "
+                                              : " -- NORMAL -- ") |
+                    color(mode == ChatMode::Insert ? pal.insert_mode
+                                                   : pal.normal_mode) |
+                    bold,
             }),
+            text(mode == ChatMode::Insert
+                     ? "INSERT · type · Esc → NORMAL"
+                     : "NORMAL · j k move · Tab field · i a edit · "
+                       "Enter activate · q/Esc cancel") |
+                color(pal.muted) | dim | center,
         }) | border | color(pal.border);
     });
 
-    auto with_escape = CatchEvent(renderer, [&](Event e) {
-        if (e == Event::Escape) {
-            keep_going = false;
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        return false;
+    auto modal = vimModalLayer(renderer, mode, [&] {
+        keep_going = false;
+        screen.ExitLoopClosure()();
     });
 
     while (keep_going) {
-        screen.Loop(with_escape);
+        screen.Loop(modal);
         break;
     }
     return changed;
