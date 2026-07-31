@@ -2,7 +2,6 @@
 
 #include <cstdlib>
 #include <fstream>
-#include <stdexcept>
 #include <system_error>
 
 #include <nlohmann/json.hpp>
@@ -11,50 +10,6 @@ namespace ovicode {
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
-
-const std::vector<ProviderInfo>& knownProviders() {
-    static const std::vector<ProviderInfo> v = {
-        {Provider::Anthropic, "Anthropic (Claude)", "claude-sonnet-4-6",
-         "https://api.anthropic.com", true},
-        {Provider::OpenAI, "OpenAI", "gpt-5.4", "https://api.openai.com", true},
-        {Provider::Gemini, "Google Gemini", "gemini-2.5-flash",
-         "https://generativelanguage.googleapis.com", true},
-        {Provider::Llamacpp, "Local (llama.cpp)", "local-model",
-         "http://localhost:8080", false},
-        {Provider::Cerebras, "Cerebras", "gpt-oss-120b",
-         "https://api.cerebras.ai", true},
-    };
-    return v;
-}
-
-const ProviderInfo& providerInfo(Provider p) {
-    for (const auto& info : knownProviders()) {
-        if (info.provider == p) return info;
-    }
-    throw std::runtime_error("unknown provider");
-}
-
-std::string providerLabel(Provider p) { return providerInfo(p).label; }
-
-std::string providerToString(Provider p) {
-    switch (p) {
-        case Provider::Anthropic: return "anthropic";
-        case Provider::OpenAI:    return "openai";
-        case Provider::Gemini:    return "gemini";
-        case Provider::Llamacpp:  return "llamacpp";
-        case Provider::Cerebras:  return "cerebras";
-    }
-    return "anthropic";
-}
-
-Provider providerFromString(const std::string& s) {
-    if (s == "anthropic") return Provider::Anthropic;
-    if (s == "openai")    return Provider::OpenAI;
-    if (s == "gemini")    return Provider::Gemini;
-    if (s == "llamacpp")  return Provider::Llamacpp;
-    if (s == "cerebras")  return Provider::Cerebras;
-    return Provider::Anthropic;
-}
 
 std::string techniqueLabel(Technique t) {
     switch (t) {
@@ -122,11 +77,11 @@ std::string themeDescription(Theme t) {
         case Theme::Auto:
             return "Follow the OS / terminal: macOS Appearance, then $COLORFGBG, then Dark.";
         case Theme::Dark:
-            return "Bright accents on a dark background.";
+            return "High-contrast accents on a fixed dark canvas.";
         case Theme::Light:
-            return "Saturated mid-tones legible on a light background.";
+            return "High-contrast accents on a fixed light canvas.";
         case Theme::Plain:
-            return "Monochrome: terminal-default foreground, no accent colors.";
+            return "High-contrast monochrome with no accent colors.";
     }
     return "";
 }
@@ -159,51 +114,23 @@ const std::vector<Theme>& allThemes() {
     return v;
 }
 
-const std::vector<std::string>& knownModels(Provider p) {
-    static const std::vector<std::string> anthropic = {
-        "claude-opus-4-7",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5-20251001",
-        "claude-opus-4-6",
-        "claude-sonnet-4-5-20250929",
-        "claude-opus-4-5-20251101",
-        "claude-opus-4-1-20250805",
+const std::vector<std::string>& knownModels() {
+    static const std::vector<std::string> models = {
+        "anthropic/claude-sonnet-4.6",
+        "anthropic/claude-opus-4.6",
+        "anthropic/claude-haiku-4.5",
+        "openai/gpt-5.4",
+        "openai/gpt-5.4-mini",
+        "google/gemini-3.1-pro-preview",
+        "google/gemini-3-flash-preview",
+        "deepseek/deepseek-v3.2",
+        "qwen/qwen3-coder",
+        "openai/gpt-oss-120b",
     };
-    static const std::vector<std::string> openai = {
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.4-nano",
-    };
-    static const std::vector<std::string> gemini = {
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-3.1-pro-preview",
-        "gemini-3.5-flash",
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite",
-    };
-    static const std::vector<std::string> llamacpp = {
-        "local-model",
-        "qwen2.5-coder",
-        "llama-3.1-8b-instruct",
-        "deepseek-coder-v2",
-        "mistral-7b-instruct",
-    };
-    static const std::vector<std::string> cerebras = {
-        "gpt-oss-120b",
-        "zai-glm-4.7",
-    };
-    switch (p) {
-        case Provider::Anthropic: return anthropic;
-        case Provider::OpenAI:    return openai;
-        case Provider::Gemini:    return gemini;
-        case Provider::Llamacpp:  return llamacpp;
-        case Provider::Cerebras:  return cerebras;
-    }
-    return anthropic;
+    return models;
 }
+
+const std::string& defaultModel() { return knownModels().front(); }
 
 fs::path defaultConfigDir() {
     const char* home = std::getenv("HOME");
@@ -249,12 +176,21 @@ std::optional<Config> loadConfig(const fs::path& path) {
         return std::nullopt;
     }
     Config c;
-    c.provider = providerFromString(j.value("provider", "anthropic"));
-    c.model = j.value("model", providerInfo(c.provider).default_model);
-    c.api_key = j.value("api_key", "");
-    c.base_url = j.value("base_url", providerInfo(c.provider).default_base_url);
+    c.model = j.value("model", defaultModel());
+    c.openrouter_api_key = j.value("openrouter_api_key", std::string{});
+
+    // Older configs stored provider-native model names. Prefix the known ones
+    // so they remain usable through OpenRouter after migration.
+    if (c.model.find('/') == std::string::npos) {
+        const std::string provider = j.value("provider", "");
+        if (provider == "anthropic") c.model = "anthropic/" + c.model;
+        else if (provider == "openai") c.model = "openai/" + c.model;
+        else if (provider == "gemini") c.model = "google/" + c.model;
+        else if (provider == "cerebras" && c.model == "gpt-oss-120b")
+            c.model = "openai/" + c.model;
+    }
     c.technique = techniqueFromString(j.value("technique", "standard"));
-    c.theme = themeFromString(j.value("theme", "auto"));
+    c.theme = themeFromString(j.value("theme", "plain"));
     c.max_tool_iterations = j.value("max_tool_iterations", 12);
     c.ralph_iterations = j.value("ralph_iterations", 3);
     c.max_tokens = j.value("max_tokens", 4096);
@@ -266,10 +202,8 @@ bool saveConfig(const Config& cfg, const fs::path& path) {
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
     json j = {
-        {"provider", providerToString(cfg.provider)},
         {"model", cfg.model},
-        {"api_key", cfg.api_key},
-        {"base_url", cfg.base_url},
+        {"openrouter_api_key", cfg.openrouter_api_key},
         {"technique", techniqueToString(cfg.technique)},
         {"theme", themeToString(cfg.theme)},
         {"max_tool_iterations", cfg.max_tool_iterations},

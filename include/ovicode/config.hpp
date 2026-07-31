@@ -7,14 +7,6 @@
 
 namespace ovicode {
 
-enum class Provider {
-    Anthropic,
-    OpenAI,
-    Gemini,
-    Llamacpp,
-    Cerebras,
-};
-
 enum class Technique {
     Standard,
     ChainOfThought,
@@ -26,22 +18,8 @@ enum class Theme {
     Auto,   // Follow system / terminal (auto-detected)
     Dark,
     Light,
-    Plain,  // No colors — terminal-default foreground only
+    Plain,  // High-contrast monochrome
 };
-
-struct ProviderInfo {
-    Provider provider;
-    std::string label;
-    std::string default_model;
-    std::string default_base_url;
-    bool needs_api_key;
-};
-
-const std::vector<ProviderInfo>& knownProviders();
-const ProviderInfo& providerInfo(Provider p);
-std::string providerLabel(Provider p);
-Provider providerFromString(const std::string& s);
-std::string providerToString(Provider p);
 
 std::string techniqueLabel(Technique t);
 std::string techniqueDescription(Technique t);
@@ -55,15 +33,14 @@ Theme themeFromString(const std::string& s);
 std::string themeToString(Theme t);
 const std::vector<Theme>& allThemes();
 
-const std::vector<std::string>& knownModels(Provider p);
+const std::vector<std::string>& knownModels();
+const std::string& defaultModel();
 
 struct Config {
-    Provider provider = Provider::Anthropic;
-    std::string model;
-    std::string api_key;
-    std::string base_url;
+    std::string model = defaultModel();
+    std::string openrouter_api_key;
     Technique technique = Technique::Standard;
-    Theme theme = Theme::Auto;
+    Theme theme = Theme::Plain;
     int max_tool_iterations = 12;
     int ralph_iterations = 3;
     int max_tokens = 4096;

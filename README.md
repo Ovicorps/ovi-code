@@ -2,12 +2,12 @@
 
 A tiny code-editing TUI agent in C++ — inspired by Amp's *How to Build an
 Agent*. ReAct-style tool loop, three file tools (`read_file`, `list_files`,
-`edit_file`), an FTXUI terminal UI, and pluggable LLM providers.
+`edit_file`), an FTXUI terminal UI, and access to LLMs through OpenRouter.
 
 ## Features
 
-- **Providers**: Anthropic, OpenAI, Google Gemini, llama.cpp (local).
-- **Setup wizard** on first run: pick provider, paste API key, pick model.
+- **OpenRouter**: one API key with a curated model picker and custom model IDs.
+- **Setup wizard** on first run: paste an OpenRouter API key and pick a model.
 - **TUI**: full-screen chat with live transcript of model output, tool calls,
   and tool results. Vim-style modal input (Insert by default; Esc → Normal)
   with single-key actions for settings, technique, clear, and quit.
@@ -54,13 +54,18 @@ for how to cut a tagged release and publish the tap.
 ./build/ovi-code --workspace ~/proj
 ./build/ovi-code --agent-config-dir ~/proj/.ovi-code
 ./build/ovi-code --setup               # re-run the setup wizard
+./build/ovi-code init                  # configure, save, and exit
+./build/ovi-code uninstall             # remove saved configuration
 ```
 
-The first launch opens a 4-step setup wizard: provider → API key →
-model → default technique. Settings persist to
+The first launch opens a 3-step setup wizard: OpenRouter API key → model →
+default technique. Settings persist to
 `~/.ovi-code/config.json` (mode 0600).
 
-You can override the saved key at runtime with `OVI_CODE_API_KEY`.
+`ovi-code uninstall` removes only the saved configuration. If installed with
+Homebrew, remove the binary separately with `brew uninstall ovi-code`.
+
+You can override the saved key at runtime with `OPENROUTER_API_KEY`.
 
 ## Keybindings (chat screen)
 
@@ -85,6 +90,8 @@ XON/XOFF flow control on many setups.
 | `s`                  | Open settings             |
 | `t`                  | Cycle agentic technique   |
 | `c`                  | Clear the transcript view |
+| `yy`                 | Copy the current line     |
+| `p` / `P`            | Paste after / before      |
 
 ## Tools exposed to the model
 
@@ -105,4 +112,47 @@ concatenated into the system prompt:
 - `tools.md` — notes appended to each tool's usage.
 - `skills.md` — named recipes the model can reference.
 
+Open Settings with `s`, then choose **Edit tools.md** or **Edit skills.md** to
+edit either file in the built-in Vim-style editor. In Normal mode, use `s` to
+save or `q` to cancel. Files are read from and written to `--agent-config-dir`
+(the workspace by default), and saved changes apply on the next agent turn.
+
 This repository ships example versions of all three at the root.
+
+## A Poem About a Duck
+
+```
+A little duck waddles along the shore,
+with orange feet and nothing more
+than a beak full of bread and a heart full of song,
+quacking softly all day long.
+
+He dips beneath the glassy lake,
+leaves a ripple in his wake,
+then pops back up without a care —
+shaking droplets from his hair.
+
+If you're debugging late at night
+and nothing seems to work quite right,
+just think about that duck, my friend:
+he'll quack you through it in the end.
+```
+
+## A Poem About a Cat
+
+```
+A small gray cat on silent feet
+slips like moonlight down the street,
+with emerald eyes and whiskers bright,
+keeper of the silver night.
+
+She curls beside the window pane,
+and listens to the gentle rain,
+then purrs as if the world were made
+for quiet dreams and striped shade.
+
+If code begins to snarl and spat,
+take a lesson from the cat:
+stretch, blink slow, then try once more —
+and peace will pad across the floor.
+```

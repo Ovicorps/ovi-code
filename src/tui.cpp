@@ -5,10 +5,13 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <ftxui/component/component.hpp>
@@ -37,15 +40,16 @@ enum class ChatMode { Insert, Normal };
 
 // ---- Theme / palette ----------------------------------------------------
 //
-// Every Color::* reference in the TUI is routed through Palette so we get
-// consistent contrast on both dark and light terminals. Auto-detection
-// reads $COLORFGBG (set by xterm-flavored emulators, iTerm2, kitty,
-// alacritty, wezterm); when absent we default to Dark. Users can override
-// permanently via the settings screen.
+// Every color in the TUI is routed through Palette. Each palette owns both
+// foreground and background, so contrast never depends on the terminal's
+// configured background color. Auto-detection only chooses which complete
+// canvas to use; users can override it permanently in settings.
 struct Palette {
+    Color foreground;
+    Color background;
     Color border;
     Color accent;          // app name, prompt glyph (neutral)
-    Color muted;           // dim status text (provider / model)
+    Color muted;           // secondary status text (model / status)
     Color insert_mode;     // -- INSERT -- tag, prompt glyph in Insert
     Color normal_mode;     // -- NORMAL -- tag, prompt glyph in Normal
     Color busy;            // "thinking…"
@@ -59,86 +63,75 @@ struct Palette {
     Color error;
     Color logo;
     Color logo_subtitle;
-    // Plain mode collapses every slot to Color::Default. We still expose the
-    // flag so call sites can suppress contrast-reducing modifiers (notably
-    // the `dim` body styling) — otherwise transcript bodies render gray on
-    // gray and become unreadable in monochrome terminals.
-    bool plain = false;
 };
 
 Palette darkPalette() {
     return Palette{
-        /*border         */ Color::GrayDark,
-        /*accent         */ Color::CyanLight,
-        /*muted          */ Color::GrayLight,
-        /*insert_mode    */ Color::GreenLight,
-        /*normal_mode    */ Color::YellowLight,
-        /*busy           */ Color::YellowLight,
-        /*ready          */ Color::GrayLight,
-        /*technique      */ Color::MagentaLight,
-        /*user_entry     */ Color::YellowLight,
-        /*assistant_entry*/ Color::GreenLight,
-        /*tool_call      */ Color::CyanLight,
-        /*tool_result    */ Color::BlueLight,
-        /*system_entry   */ Color::MagentaLight,
-        /*error          */ Color::RedLight,
-        /*logo           */ Color::CyanLight,
-        /*logo_subtitle  */ Color::GrayLight,
-        /*plain          */ false,
+        /*foreground     */ Color::RGB(242, 244, 248),
+        /*background     */ Color::RGB(11, 13, 16),
+        /*border         */ Color::RGB(183, 192, 204),
+        /*accent         */ Color::RGB(99, 217, 230),
+        /*muted          */ Color::RGB(183, 192, 204),
+        /*insert_mode    */ Color::RGB(112, 217, 139),
+        /*normal_mode    */ Color::RGB(244, 201, 93),
+        /*busy           */ Color::RGB(244, 201, 93),
+        /*ready          */ Color::RGB(183, 192, 204),
+        /*technique      */ Color::RGB(214, 165, 247),
+        /*user_entry     */ Color::RGB(244, 201, 93),
+        /*assistant_entry*/ Color::RGB(112, 217, 139),
+        /*tool_call      */ Color::RGB(99, 217, 230),
+        /*tool_result    */ Color::RGB(128, 191, 255),
+        /*system_entry   */ Color::RGB(214, 165, 247),
+        /*error          */ Color::RGB(255, 123, 114),
+        /*logo           */ Color::RGB(99, 217, 230),
+        /*logo_subtitle  */ Color::RGB(183, 192, 204),
     };
 }
 
 Palette lightPalette() {
-    // Light terminals: the bright/“Light” FTXUI variants wash out against a
-    // white background. Use the saturated base colors plus dark gray for
-    // muted text — these stay readable on Solarized Light, Apple Light, etc.
-    // Border uses GrayDark (not GrayLight) so the frame actually shows up
-    // against a near-white background.
     return Palette{
-        /*border         */ Color::GrayDark,
-        /*accent         */ Color::Blue,
-        /*muted          */ Color::GrayDark,
-        /*insert_mode    */ Color::Green,
-        /*normal_mode    */ Color::Red,
-        /*busy           */ Color::Magenta,
-        /*ready          */ Color::GrayDark,
-        /*technique      */ Color::Magenta,
-        /*user_entry     */ Color::Magenta,
-        /*assistant_entry*/ Color::Green,
-        /*tool_call      */ Color::Blue,
-        /*tool_result    */ Color::Cyan,
-        /*system_entry   */ Color::GrayDark,
-        /*error          */ Color::Red,
-        /*logo           */ Color::Blue,
-        /*logo_subtitle  */ Color::GrayDark,
-        /*plain          */ false,
+        /*foreground     */ Color::RGB(17, 19, 24),
+        /*background     */ Color::RGB(250, 250, 250),
+        /*border         */ Color::RGB(71, 81, 93),
+        /*accent         */ Color::RGB(7, 90, 156),
+        /*muted          */ Color::RGB(71, 81, 93),
+        /*insert_mode    */ Color::RGB(23, 107, 53),
+        /*normal_mode    */ Color::RGB(155, 28, 49),
+        /*busy           */ Color::RGB(122, 62, 0),
+        /*ready          */ Color::RGB(71, 81, 93),
+        /*technique      */ Color::RGB(111, 42, 142),
+        /*user_entry     */ Color::RGB(122, 62, 0),
+        /*assistant_entry*/ Color::RGB(23, 107, 53),
+        /*tool_call      */ Color::RGB(7, 90, 156),
+        /*tool_result    */ Color::RGB(11, 95, 106),
+        /*system_entry   */ Color::RGB(111, 42, 142),
+        /*error          */ Color::RGB(163, 19, 42),
+        /*logo           */ Color::RGB(7, 90, 156),
+        /*logo_subtitle  */ Color::RGB(71, 81, 93),
     };
 }
 
 Palette plainPalette() {
-    // Every slot resolves to the terminal's default foreground color, so the
-    // TUI renders as monochrome plain text regardless of light/dark
-    // background. Bold/inverted modifiers still apply (we need them for the
-    // cursor cell and headings) but no hue is ever emitted.
-    Color d = Color::Default;
+    Color fg = Color::RGB(245, 245, 245);
     return Palette{
-        /*border         */ d,
-        /*accent         */ d,
-        /*muted          */ d,
-        /*insert_mode    */ d,
-        /*normal_mode    */ d,
-        /*busy           */ d,
-        /*ready          */ d,
-        /*technique      */ d,
-        /*user_entry     */ d,
-        /*assistant_entry*/ d,
-        /*tool_call      */ d,
-        /*tool_result    */ d,
-        /*system_entry   */ d,
-        /*error          */ d,
-        /*logo           */ d,
-        /*logo_subtitle  */ d,
-        /*plain          */ true,
+        /*foreground     */ fg,
+        /*background     */ Color::RGB(10, 10, 10),
+        /*border         */ fg,
+        /*accent         */ fg,
+        /*muted          */ fg,
+        /*insert_mode    */ fg,
+        /*normal_mode    */ fg,
+        /*busy           */ fg,
+        /*ready          */ fg,
+        /*technique      */ fg,
+        /*user_entry     */ fg,
+        /*assistant_entry*/ fg,
+        /*tool_call      */ fg,
+        /*tool_result    */ fg,
+        /*system_entry   */ fg,
+        /*error          */ fg,
+        /*logo           */ fg,
+        /*logo_subtitle  */ fg,
     };
 }
 
@@ -204,10 +197,32 @@ const Palette& palette(Theme t) {
     return dark;
 }
 
-std::vector<std::string> providerLabels() {
-    std::vector<std::string> out;
-    for (const auto& p : knownProviders()) out.push_back(p.label);
-    return out;
+Element onPaletteCanvas(const Palette& pal, Element element) {
+    return std::move(element) | color(pal.foreground) |
+           bgcolor(pal.background);
+}
+
+InputOption paletteInputOption(const Config& cfg) {
+    InputOption option;
+    option.transform = [&cfg](InputState state) {
+        const Palette& pal = palette(cfg.theme);
+        state.element |= color(state.is_placeholder ? pal.muted
+                                                    : pal.foreground);
+        if (state.focused) state.element |= inverted;
+        return state.element;
+    };
+    return option;
+}
+
+MenuOption highContrastMenuOption() {
+    MenuOption option = MenuOption::Vertical();
+    option.entries_option.transform = [](const EntryState& state) {
+        Element entry = text((state.active ? "> " : "  ") + state.label);
+        if (state.focused) entry |= inverted;
+        if (state.active) entry |= bold;
+        return entry;
+    };
+    return option;
 }
 
 std::vector<std::string> techniqueLabels() {
@@ -216,14 +231,6 @@ std::vector<std::string> techniqueLabels() {
         out.push_back(techniqueLabel(t) + " — " + techniqueDescription(t));
     }
     return out;
-}
-
-int indexOfProvider(Provider p) {
-    const auto& list = knownProviders();
-    for (size_t i = 0; i < list.size(); ++i) {
-        if (list[i].provider == p) return static_cast<int>(i);
-    }
-    return 0;
 }
 
 int indexOfTechnique(Technique t) {
@@ -239,7 +246,7 @@ int indexOfModel(const std::vector<std::string>& models,
     for (size_t i = 0; i < models.size(); ++i) {
         if (models[i] == m) return static_cast<int>(i);
     }
-    return 0;
+    return -1;
 }
 
 Element banner(const Palette& pal, const std::string& title) {
@@ -311,6 +318,11 @@ Component vimModalLayer(Component child, ChatMode& mode,
                 child->OnEvent(Event::ArrowRight);
                 return true;
             }
+            // Space commits the focused Radiobox selection (FTXUI Radiobox
+            // selects on Space/Enter). Let it fall through to the child so the
+            // settings selectors behave like radio buttons. Enter already
+            // reaches components natively (it isn't a "character" event).
+            if (e == Event::Character(" ")) return false;
             // Swallow any other raw character so focused Inputs stay inert in
             // NORMAL; arrows / Tab / Enter still reach the components natively.
             if (e.is_character()) return true;
@@ -338,62 +350,42 @@ bool runSetupWizard(Config& cfg) {
     clearTerminal();
     auto screen = ScreenInteractive::TerminalOutput();
 
-    int step = 0;  // 0=provider, 1=key, 2=model, 3=technique
-    int provider_idx = indexOfProvider(cfg.provider);
+    int step = 0;  // 0=OpenRouter key, 1=model, 2=technique
     int technique_idx = indexOfTechnique(cfg.technique);
-    std::string api_key = cfg.api_key;
-    std::string base_url;
-    std::string model;
-    int model_idx = 0;
+    std::string api_key = cfg.openrouter_api_key;
+    std::string model = cfg.model.empty() ? defaultModel() : cfg.model;
     bool aborted = false;
     bool finished = false;
     // Start in NORMAL so j/k drive the menus immediately; i/a edits inputs.
     ChatMode mode = ChatMode::Normal;
 
-    auto provider_choices = providerLabels();
     auto technique_choices = techniqueLabels();
 
-    auto provider_menu = Menu(&provider_choices, &provider_idx);
-
-    InputOption key_opts;
+    InputOption key_opts = paletteInputOption(cfg);
     key_opts.password = true;
-    auto key_input = Input(&api_key, "sk-…", key_opts);
+    auto key_input = Input(&api_key, "sk-or-v1-...", key_opts);
 
-    InputOption url_opts;
-    auto url_input = Input(&base_url, "");
+    std::vector<std::string> model_choices = knownModels();
+    model_choices.push_back("(custom — type below)");
+    int model_idx = indexOfModel(model_choices, model);
+    if (model_idx < 0) model_idx = static_cast<int>(model_choices.size()) - 1;
+    auto model_menu =
+        Menu(&model_choices, &model_idx, highContrastMenuOption());
+    auto model_input = Input(&model, "", paletteInputOption(cfg));
 
-    std::vector<std::string> model_choices;
-    auto model_menu = Menu(&model_choices, &model_idx);
-    auto model_input = Input(&model, "");
-
-    auto technique_menu = Menu(&technique_choices, &technique_idx);
-
-    auto refreshModels = [&] {
-        Provider p = knownProviders()[provider_idx].provider;
-        model_choices = knownModels(p);
-        model_choices.push_back("(custom — type below)");
-        if (model.empty() || indexOfModel(model_choices, model) < 0)
-            model = knownProviders()[provider_idx].default_model;
-        model_idx = indexOfModel(model_choices, model);
-        if (base_url.empty())
-            base_url = knownProviders()[provider_idx].default_base_url;
-    };
-    refreshModels();
+    auto technique_menu =
+        Menu(&technique_choices, &technique_idx, highContrastMenuOption());
 
     auto next_button = Button("Next  ▶", [&] {
         if (step == 0) {
-            cfg.provider = knownProviders()[provider_idx].provider;
-            refreshModels();
-            step = knownProviders()[provider_idx].needs_api_key ? 1 : 2;
-        } else if (step == 1) {
             ++step;
-        } else if (step == 2) {
+        } else if (step == 1) {
             if (model_idx >= 0 &&
                 model_idx < static_cast<int>(model_choices.size()) - 1) {
                 model = model_choices[model_idx];
             }
             ++step;
-        } else if (step == 3) {
+        } else if (step == 2) {
             finished = true;
             screen.ExitLoopClosure()();
         }
@@ -410,9 +402,8 @@ bool runSetupWizard(Config& cfg) {
 
     auto layout = Container::Tab(
         {
-            provider_menu,
-            Container::Vertical({key_input, url_input}),
-            Container::Vertical({model_menu, model_input, url_input}),
+            key_input,
+            Container::Vertical({model_menu, model_input}),
             technique_menu,
         },
         &step);
@@ -421,44 +412,35 @@ bool runSetupWizard(Config& cfg) {
 
     auto renderer = Renderer(root, [&] {
         const Palette& pal = palette(cfg.theme);
+        // See makeSettingsPanel: hide the cursor by default so it only appears
+        // (as a block) on the focused Input, never lingering on the menus.
+        screen.SetCursor(Screen::Cursor{0, 0, Screen::Cursor::Hidden});
         Element body;
         if (step == 0) {
             body = vbox({
-                text("1. Choose your LLM provider:") | bold | color(pal.accent),
-                separator(),
-                provider_menu->Render() | frame |
-                    size(HEIGHT, LESS_THAN, 12),
-            });
-        } else if (step == 1) {
-            const auto& info = knownProviders()[provider_idx];
-            body = vbox({
-                text("2. " + info.label + " — API key") | bold |
-                    color(pal.accent),
+                text("1. Configure OpenRouter") | bold | color(pal.accent),
                 separator(),
                 hbox({text("API key: "), blockCursorInput(key_input)}),
-                text(""),
-                hbox({text("Base URL: "), blockCursorInput(url_input)}),
                 text(""),
                 paragraph(
                     "Your key is saved to ~/.ovi-code/config.json "
                     "with 0600 permissions. Leave blank to skip if you set "
-                    "the key via an environment variable.") |
+                    "OPENROUTER_API_KEY in the environment.") |
                     color(pal.muted),
             });
-        } else if (step == 2) {
+        } else if (step == 1) {
             body = vbox({
-                text("3. Choose a model") | bold | color(pal.accent),
+                text("2. Choose an OpenRouter model") | bold |
+                    color(pal.accent),
                 separator(),
                 model_menu->Render() | frame |
                     size(HEIGHT, LESS_THAN, 10),
                 text(""),
                 hbox({text("Custom model: "), blockCursorInput(model_input)}),
-                text(""),
-                hbox({text("Base URL:     "), blockCursorInput(url_input)}),
             });
         } else {
             body = vbox({
-                text("4. Choose default agentic technique") | bold |
+                text("3. Choose default agentic technique") | bold |
                     color(pal.accent),
                 separator(),
                 technique_menu->Render() | frame |
@@ -470,7 +452,7 @@ bool runSetupWizard(Config& cfg) {
                     color(pal.muted),
             });
         }
-        return vbox({
+        Element content = vbox({
             banner(pal, "setup"),
             text(""),
             body,
@@ -489,14 +471,17 @@ bool runSetupWizard(Config& cfg) {
                                                    : pal.normal_mode) |
                     bold,
                 text("  "),
-                text("step " + std::to_string(step + 1) + "/4") | dim,
+                text("step " + std::to_string(step + 1) + "/3") |
+                    color(pal.muted),
             }),
             text(mode == ChatMode::Insert
                      ? "INSERT · type · Esc → NORMAL"
                      : "NORMAL · j k move · Tab field · i a edit · "
                        "Enter select · q cancel") |
-                color(pal.muted) | dim | center,
-        }) | border | color(pal.border);
+                color(pal.muted) | center,
+        }) | color(pal.foreground);
+        return onPaletteCanvas(
+            pal, std::move(content) | border | color(pal.border));
     });
 
     auto modal = vimModalLayer(renderer, mode, [&] {
@@ -508,205 +493,231 @@ bool runSetupWizard(Config& cfg) {
     if (aborted) return false;
     if (!finished) return false;
 
-    cfg.provider = knownProviders()[provider_idx].provider;
     if (model_idx >= 0 &&
         model_idx < static_cast<int>(model_choices.size()) - 1) {
         cfg.model = model_choices[model_idx];
     } else if (!model.empty()) {
         cfg.model = model;
     } else {
-        cfg.model = knownProviders()[provider_idx].default_model;
+        cfg.model = defaultModel();
     }
-    cfg.api_key = api_key;
-    cfg.base_url =
-        base_url.empty() ? knownProviders()[provider_idx].default_base_url
-                         : base_url;
+    cfg.openrouter_api_key = api_key;
     cfg.technique = allTechniques()[technique_idx];
     return true;
 }
 
 // -- Settings screen --------------------------------------------------------
 
-bool runSettingsScreen(Config& cfg) {
-    clearTerminal();
-    auto screen = ScreenInteractive::TerminalOutput();
-    bool changed = false;
-    bool keep_going = true;
-    // Start in NORMAL so j/k navigate the form; i/a edits the focused input.
-    ChatMode mode = ChatMode::Normal;
+namespace {
 
-    int provider_idx = indexOfProvider(cfg.provider);
-    int technique_idx = indexOfTechnique(cfg.technique);
+// Mutable state backing the settings modal. Held by shared_ptr so the pointers
+// bound into the Radiobox/Input components stay valid for the whole lifetime of
+// the panel (which now lives as long as the chat screen, not a single Loop).
+struct SettingsState {
+    int technique_idx = 0;
     int theme_idx = 0;
-    {
-        const auto& list = allThemes();
-        for (size_t i = 0; i < list.size(); ++i) {
-            if (list[i] == cfg.theme) { theme_idx = static_cast<int>(i); break; }
-        }
-    }
-    std::string api_key = cfg.api_key;
-    std::string base_url = cfg.base_url;
-    std::string model = cfg.model;
-    std::string max_iters_s = std::to_string(cfg.max_tool_iterations);
-    std::string ralph_s = std::to_string(cfg.ralph_iterations);
-    std::string temp_s = std::to_string(cfg.temperature);
+    int model_idx = 0;
+    std::string api_key, model, max_iters_s, ralph_s, temp_s;
+    std::vector<std::string> technique_choices, theme_choices, model_choices;
+};
 
-    auto provider_choices = providerLabels();
-    auto provider_menu = Menu(&provider_choices, &provider_idx);
+// The settings panel as an embeddable modal: `component` is layered over the
+// chat screen via ftxui::Modal, and `sync` re-reads every field from `cfg`
+// (call it right before showing the panel so it reflects the live config).
+struct SettingsPanel {
+    Component component;
+    std::function<void()> sync;
+};
 
-    auto technique_choices = techniqueLabels();
-    auto technique_menu = Menu(&technique_choices, &technique_idx);
+// Build the settings form as a modal component instead of its own
+// ScreenInteractive. `mode` is the panel's own NORMAL/INSERT state (owned by
+// the caller so the footer can show it). `close(changed)` is invoked when the
+// user saves (changed == true) or cancels (false); the caller hides the modal
+// there. `screen` is used only to pin the cursor (see runChatScreen).
+SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
+                                 ChatMode& mode,
+                                 std::function<void(bool changed)> close,
+                                 std::function<void()> edit_tools,
+                                 std::function<void()> edit_skills) {
+    auto st = std::make_shared<SettingsState>();
+    st->technique_choices = techniqueLabels();
+    for (auto t : allThemes())
+        st->theme_choices.push_back(themeLabel(t) + " — " +
+                                    themeDescription(t));
 
-    std::vector<std::string> theme_choices;
-    for (auto t : allThemes()) {
-        theme_choices.push_back(themeLabel(t) + " — " + themeDescription(t));
-    }
-    auto theme_menu = Menu(&theme_choices, &theme_idx);
+    // Radiobox (vs Menu) gives single-select radio behaviour: navigating the
+    // list moves focus but does not change the saved value — only Space/Enter
+    // commits the focused entry, and the ◉/◯ glyph marks the active choice.
+    auto technique_menu = Radiobox(&st->technique_choices, &st->technique_idx);
+    auto theme_menu = Radiobox(&st->theme_choices, &st->theme_idx);
+    auto model_menu = Radiobox(&st->model_choices, &st->model_idx);
+    auto model_input =
+        Input(&st->model, "model id", paletteInputOption(cfg));
 
-    std::vector<std::string> model_choices = knownModels(cfg.provider);
-    model_choices.push_back("(custom — type below)");
-    int model_idx = indexOfModel(model_choices, cfg.model);
-    auto model_menu = Menu(&model_choices, &model_idx);
-    auto model_input = Input(&model, "model id");
-
-    InputOption pw;
+    InputOption pw = paletteInputOption(cfg);
     pw.password = true;
-    auto key_input = Input(&api_key, "API key", pw);
-    auto url_input = Input(&base_url, "base url");
-    auto iters_input = Input(&max_iters_s, "max tool iters");
-    auto ralph_input = Input(&ralph_s, "ralph iterations");
-    auto temp_input = Input(&temp_s, "temperature");
+    auto key_input = Input(&st->api_key, "sk-or-v1-...", pw);
+    auto iters_input =
+        Input(&st->max_iters_s, "max tool iters", paletteInputOption(cfg));
+    auto ralph_input = Input(&st->ralph_s, "ralph iterations",
+                             paletteInputOption(cfg));
+    auto temp_input =
+        Input(&st->temp_s, "temperature", paletteInputOption(cfg));
 
-    auto save = [&] {
-        cfg.provider = knownProviders()[provider_idx].provider;
-        if (model_idx >= 0 &&
-            model_idx < static_cast<int>(model_choices.size()) - 1) {
-            cfg.model = model_choices[model_idx];
-        } else if (!model.empty()) {
-            cfg.model = model;
+    // Re-read every field from the live config. Called once now to initialise
+    // and again by the caller each time the panel is reopened.
+    auto sync = [st, &cfg] {
+        st->technique_idx = indexOfTechnique(cfg.technique);
+        st->theme_idx = 0;
+        const auto& themes = allThemes();
+        for (size_t i = 0; i < themes.size(); ++i)
+            if (themes[i] == cfg.theme) { st->theme_idx = (int)i; break; }
+        st->api_key = cfg.openrouter_api_key;
+        st->model = cfg.model;
+        st->max_iters_s = std::to_string(cfg.max_tool_iterations);
+        st->ralph_s = std::to_string(cfg.ralph_iterations);
+        st->temp_s = std::to_string(cfg.temperature);
+        st->model_choices = knownModels();
+        st->model_choices.push_back("(custom — type below)");
+        st->model_idx = indexOfModel(st->model_choices, cfg.model);
+        if (st->model_idx < 0) {
+            st->model_idx = static_cast<int>(st->model_choices.size()) - 1;
         }
-        cfg.api_key = api_key;
-        cfg.base_url = base_url;
-        cfg.technique = allTechniques()[technique_idx];
-        if (theme_idx >= 0 &&
-            theme_idx < static_cast<int>(allThemes().size())) {
-            cfg.theme = allThemes()[theme_idx];
-        }
-        try {
-            cfg.max_tool_iterations = std::max(1, std::stoi(max_iters_s));
-        } catch (...) {
-        }
-        try {
-            cfg.ralph_iterations = std::max(1, std::stoi(ralph_s));
-        } catch (...) {
-        }
-        try {
-            cfg.temperature = std::stod(temp_s);
-        } catch (...) {
-        }
-        changed = true;
-        keep_going = false;
-        screen.ExitLoopClosure()();
     };
-    auto refresh_models = [&] {
-        Provider p = knownProviders()[provider_idx].provider;
-        model_choices = knownModels(p);
-        model_choices.push_back("(custom — type below)");
-        model_idx = indexOfModel(model_choices, model);
+    sync();
+
+    auto save = [st, &cfg, close] {
+        if (st->model_idx >= 0 &&
+            st->model_idx < static_cast<int>(st->model_choices.size()) - 1) {
+            cfg.model = st->model_choices[st->model_idx];
+        } else if (!st->model.empty()) {
+            cfg.model = st->model;
+        }
+        cfg.openrouter_api_key = st->api_key;
+        cfg.technique = allTechniques()[st->technique_idx];
+        if (st->theme_idx >= 0 &&
+            st->theme_idx < static_cast<int>(allThemes().size())) {
+            cfg.theme = allThemes()[st->theme_idx];
+        }
+        try {
+            cfg.max_tool_iterations = std::max(1, std::stoi(st->max_iters_s));
+        } catch (...) {
+        }
+        try {
+            cfg.ralph_iterations = std::max(1, std::stoi(st->ralph_s));
+        } catch (...) {
+        }
+        try {
+            cfg.temperature = std::stod(st->temp_s);
+        } catch (...) {
+        }
+        close(true);
     };
 
     auto save_button = Button("Save", save);
-    auto cancel_button = Button("Cancel", [&] {
-        keep_going = false;
-        screen.ExitLoopClosure()();
-    });
-    auto refresh_button = Button("Refresh models", refresh_models);
+    auto cancel_button = Button("Cancel", [close] { close(false); });
+    auto tools_button = Button("Edit tools.md", std::move(edit_tools));
+    auto skills_button = Button("Edit skills.md", std::move(edit_skills));
 
     auto layout = Container::Vertical({
-        provider_menu,
-        refresh_button,
         model_menu,
         model_input,
         key_input,
-        url_input,
         technique_menu,
         theme_menu,
         iters_input,
         ralph_input,
         temp_input,
+        tools_button,
+        skills_button,
         Container::Horizontal({save_button, cancel_button}),
     });
 
-    auto renderer = Renderer(layout, [&] {
+    auto renderer = Renderer(layout, [=, &cfg, &screen, &mode] {
         const Palette& pal = palette(cfg.theme);
-        return vbox({
-            banner(pal, "settings"),
-            text(""),
+        // Default the hardware cursor to Hidden every frame; blockCursorInput
+        // re-shows a steady block only on the *focused* Input (its focusCursor
+        // node runs later in the same draw). Without this reset the cursor
+        // lingers — blinking — at the last input position whenever focus moves
+        // to a Menu/Radiobox/Button, which renders no cursor node of its own.
+        screen.SetCursor(Screen::Cursor{0, 0, Screen::Cursor::Hidden});
+
+        // The form is taller than a typical 80x24 terminal. Keep the banner,
+        // action buttons and footer pinned (always visible / reachable) and let
+        // the two-column body scroll inside a yframe — FTXUI auto-scrolls a
+        // frame to keep the focused field on screen as you Tab through. Without
+        // this the Modal's `clear_under | center` clips an oversized panel top
+        // and bottom, hiding Save/Cancel entirely on short terminals.
+        Element form =
             hbox({
                 vbox({
-                    text("Provider") | bold | color(pal.accent),
-                    provider_menu->Render() | frame |
-                        size(HEIGHT, LESS_THAN, 6),
-                    text(""),
-                    refresh_button->Render(),
-                    text(""),
-                    text("Model") | bold | color(pal.accent),
-                    model_menu->Render() | frame |
-                        size(HEIGHT, LESS_THAN, 6),
+                    text("OpenRouter model") | bold | color(pal.accent),
+                    model_menu->Render() | frame | size(HEIGHT, LESS_THAN, 10),
                     hbox({text("Custom: "), blockCursorInput(model_input)}),
                 }) | flex,
                 separator(),
                 vbox({
-                    text("API key") | bold | color(pal.accent),
+                    text("OpenRouter API key") | bold | color(pal.accent),
                     blockCursorInput(key_input),
-                    text(""),
-                    text("Base URL") | bold | color(pal.accent),
-                    blockCursorInput(url_input),
                     text(""),
                     text("Technique") | bold | color(pal.accent),
                     technique_menu->Render() | frame |
                         size(HEIGHT, LESS_THAN, 6),
                     text(""),
                     text("Theme") | bold | color(pal.accent),
-                    theme_menu->Render() | frame |
-                        size(HEIGHT, LESS_THAN, 5),
+                    theme_menu->Render() | frame | size(HEIGHT, LESS_THAN, 5),
                     text(""),
-                    hbox({text("Max tool iters: "), blockCursorInput(iters_input)}),
-                    hbox({text("Ralph iters:    "), blockCursorInput(ralph_input)}),
-                    hbox({text("Temperature:    "), blockCursorInput(temp_input)}),
+                    hbox({text("Max tool iters: "),
+                          blockCursorInput(iters_input)}),
+                    hbox({text("Ralph iters:    "),
+                          blockCursorInput(ralph_input)}),
+                    hbox({text("Temperature:    "),
+                          blockCursorInput(temp_input)}),
+                    text(""),
+                    text("Agent configuration") | bold | color(pal.accent),
+                    hbox({tools_button->Render(), text("  "),
+                          skills_button->Render()}),
                 }) | flex,
-            }),
-            separator(),
-            hbox({
-                save_button->Render(),
-                text("  "),
-                cancel_button->Render(),
-                filler(),
-                text(mode == ChatMode::Insert ? " -- INSERT -- "
-                                              : " -- NORMAL -- ") |
-                    color(mode == ChatMode::Insert ? pal.insert_mode
-                                                   : pal.normal_mode) |
-                    bold,
-            }),
-            text(mode == ChatMode::Insert
-                     ? "INSERT · type · Esc → NORMAL"
-                     : "NORMAL · j k move · Tab field · i a edit · "
-                       "Enter activate · q/Esc cancel") |
-                color(pal.muted) | dim | center,
-        }) | border | color(pal.border);
+            });
+
+        // Cap the whole panel to the live terminal height so it never exceeds
+        // the screen (border included); the flexing yframe body absorbs the
+        // squeeze while the fixed rows around it stay put.
+        int max_h = std::max(8, screen.dimy());
+        Element content = vbox({
+                   banner(pal, "settings"),
+                   text(""),
+                   form | yframe | flex,
+                   separator(),
+                   hbox({
+                       save_button->Render(),
+                       text("  "),
+                       cancel_button->Render(),
+                       filler(),
+                       text(mode == ChatMode::Insert ? " -- INSERT -- "
+                                                     : " -- NORMAL -- ") |
+                           color(mode == ChatMode::Insert ? pal.insert_mode
+                                                          : pal.normal_mode) |
+                           bold,
+                   }),
+                   text(mode == ChatMode::Insert
+                            ? "INSERT · type · Esc → NORMAL"
+                            : "NORMAL · j k move · Space select · Tab field · "
+                              "i a edit · Enter activate · q/Esc cancel") |
+                       color(pal.muted) | center,
+               }) |
+               color(pal.foreground);
+        return onPaletteCanvas(
+            pal, std::move(content) | border | color(pal.border) |
+                     size(WIDTH, LESS_THAN, 96) |
+                     size(HEIGHT, LESS_THAN, max_h + 1));
     });
 
-    auto modal = vimModalLayer(renderer, mode, [&] {
-        keep_going = false;
-        screen.ExitLoopClosure()();
-    });
-
-    while (keep_going) {
-        screen.Loop(modal);
-        break;
-    }
-    return changed;
+    auto component = vimModalLayer(renderer, mode, [close] { close(false); });
+    return SettingsPanel{component, sync};
 }
+
+}  // namespace
 
 // -- Chat screen ------------------------------------------------------------
 
@@ -721,7 +732,7 @@ Color kindColor(const Palette& pal, TranscriptEntry::Kind k) {
         case TranscriptEntry::Kind::System:     return pal.system_entry;
         case TranscriptEntry::Kind::Error:      return pal.error;
     }
-    return Color::Default;
+    return pal.foreground;
 }
 
 const char* kindLabel(TranscriptEntry::Kind k) {
@@ -778,11 +789,7 @@ Element renderEntry(const Palette& pal, const TranscriptEntry& e) {
         std::string line;
         while (std::getline(is, line)) body_lines.push_back(paragraph(line));
         if (body_lines.empty()) body_lines.push_back(text(""));
-        // In Plain mode we drop `dim` — without it the body is the only
-        // signal carrying the transcript content, and dim-on-default is
-        // unreadable in monochrome terminals where there's no color to
-        // distinguish title from body.
-        body = pal.plain ? vbox(body_lines) : vbox(body_lines) | dim;
+        body = vbox(body_lines) | color(pal.foreground);
     }
     return vbox({header, body, text("")}) | xflex;
 }
@@ -794,12 +801,17 @@ Element renderEntry(const Palette& pal, const TranscriptEntry& e) {
 // and has no notion of modes. Instead the chat screen owns a VimEditor and
 // renders it manually. A hidden Input still sits in the component tree only
 // to absorb focus so events reach our CatchEvent handler.
+struct VimClipboard {
+    std::vector<std::string> lines;
+};
+
 struct VimEditor {
     std::vector<std::string> lines{""};
     int row = 0;
     int col = 0;
     ChatMode mode = ChatMode::Insert;
     std::string pending_op;  // first key of a 2-key motion like "dd"/"gg"
+    std::string clipboard_notice;
 
     bool isEmpty() const {
         return lines.size() == 1 && lines[0].empty();
@@ -818,6 +830,25 @@ struct VimEditor {
         lines = {""};
         row = col = 0;
         pending_op.clear();
+        clipboard_notice.clear();
+    }
+
+    void setText(const std::string& value) {
+        lines.clear();
+        size_t start = 0;
+        while (true) {
+            const size_t newline = value.find('\n', start);
+            if (newline == std::string::npos) {
+                lines.push_back(value.substr(start));
+                break;
+            }
+            lines.push_back(value.substr(start, newline - start));
+            start = newline + 1;
+        }
+        row = col = 0;
+        mode = ChatMode::Normal;
+        pending_op.clear();
+        clipboard_notice.clear();
     }
 
     void clampCursor() {
@@ -869,6 +900,28 @@ struct VimEditor {
         if (lines.empty()) lines.push_back("");
         if (row >= (int)lines.size()) row = (int)lines.size() - 1;
         col = 0;
+    }
+
+    void yankLine(VimClipboard& clipboard) {
+        clipboard.lines = {lines[row]};
+        clipboard_notice = " [COPIED 1 LINE] ";
+    }
+
+    void pasteLine(const VimClipboard& clipboard, bool before) {
+        if (clipboard.lines.empty()) {
+            clipboard_notice = " [NOTHING TO PASTE] ";
+            return;
+        }
+        const int insertion_row = before ? row : row + 1;
+        lines.insert(lines.begin() + insertion_row,
+                     clipboard.lines.begin(), clipboard.lines.end());
+        row = insertion_row;
+        col = 0;
+        clipboard_notice = " [PASTED " +
+                           std::to_string(clipboard.lines.size()) +
+                           (clipboard.lines.size() == 1 ? " LINE] "
+                                                        : " LINES] ");
+        clampCursor();
     }
 
     void openLineBelow() {
@@ -930,6 +983,127 @@ struct VimEditor {
     }
 };
 
+// Shared Vim editing behavior for both the chat prompt and agent configuration
+// files. Return in Normal mode and app-level commands are left to the caller.
+bool handleVimEditorEvent(VimEditor& editor, VimClipboard& clipboard,
+                          Event event) {
+    if (editor.mode == ChatMode::Insert) {
+        if (event == Event::Escape) {
+            editor.mode = ChatMode::Normal;
+            editor.clampCursor();
+            return true;
+        }
+        if (event == Event::Return) { editor.insertNewline(); return true; }
+        if (event == Event::Backspace) { editor.backspace(); return true; }
+        if (event == Event::Delete) { editor.deleteCharUnder(); return true; }
+        if (event == Event::ArrowLeft)  { editor.moveLeft();  return true; }
+        if (event == Event::ArrowRight) { editor.moveRight(); return true; }
+        if (event == Event::ArrowUp)    { editor.moveUp();    return true; }
+        if (event == Event::ArrowDown)  { editor.moveDown();  return true; }
+        if (event == Event::Home)       { editor.lineStart(); return true; }
+        if (event == Event::End)        { editor.lineEnd();   return true; }
+        if (event == Event::Tab) {
+            editor.insertString("    ");
+            return true;
+        }
+        if (event.is_character()) {
+            editor.insertString(event.character());
+            return true;
+        }
+        return true;
+    }
+
+    if (!editor.pending_op.empty()) {
+        std::string op = editor.pending_op;
+        editor.pending_op.clear();
+        if (op == "d" && event == Event::Character("d")) {
+            editor.deleteLine();
+            return true;
+        }
+        if (op == "g" && event == Event::Character("g")) {
+            editor.firstLine();
+            return true;
+        }
+        if (op == "y" && event == Event::Character("y")) {
+            editor.yankLine(clipboard);
+            return true;
+        }
+    }
+
+    if (event == Event::Escape) return true;
+    if (event == Event::Character("h") || event == Event::ArrowLeft) {
+        editor.moveLeft(); return true;
+    }
+    if (event == Event::Character("l") || event == Event::ArrowRight) {
+        editor.moveRight(); return true;
+    }
+    if (event == Event::Character("j") || event == Event::ArrowDown) {
+        editor.moveDown(); return true;
+    }
+    if (event == Event::Character("k") || event == Event::ArrowUp) {
+        editor.moveUp(); return true;
+    }
+    if (event == Event::Character("0") || event == Event::Home) {
+        editor.lineStart(); return true;
+    }
+    if (event == Event::Character("$") || event == Event::End) {
+        editor.lineEnd(); return true;
+    }
+    if (event == Event::Character("w")) { editor.wordForward(); return true; }
+    if (event == Event::Character("b")) { editor.wordBack();    return true; }
+    if (event == Event::Character("G")) { editor.lastLine();    return true; }
+    if (event == Event::Character("p")) {
+        editor.pasteLine(clipboard, false); return true;
+    }
+    if (event == Event::Character("P")) {
+        editor.pasteLine(clipboard, true); return true;
+    }
+
+    if (event == Event::Character("x")) {
+        editor.deleteCharUnder(); return true;
+    }
+    if (event == Event::Character("o")) {
+        editor.openLineBelow(); return true;
+    }
+    if (event == Event::Character("O")) {
+        editor.openLineAbove(); return true;
+    }
+    if (event == Event::Character("i")) {
+        editor.mode = ChatMode::Insert;
+        editor.clampCursor();
+        return true;
+    }
+    if (event == Event::Character("a")) {
+        editor.mode = ChatMode::Insert;
+        if (editor.col < (int)editor.lines[editor.row].size()) ++editor.col;
+        editor.clampCursor();
+        return true;
+    }
+    if (event == Event::Character("I")) {
+        editor.mode = ChatMode::Insert;
+        editor.col = 0;
+        return true;
+    }
+    if (event == Event::Character("A")) {
+        editor.mode = ChatMode::Insert;
+        editor.col = (int)editor.lines[editor.row].size();
+        return true;
+    }
+    if (event == Event::Character("d")) {
+        editor.pending_op = "d";
+        return true;
+    }
+    if (event == Event::Character("g")) {
+        editor.pending_op = "g";
+        return true;
+    }
+    if (event == Event::Character("y")) {
+        editor.pending_op = "y";
+        return true;
+    }
+    return false;
+}
+
 Element renderEditor(const VimEditor& ed, const Palette& pal,
                      bool minimized = false) {
     int total = (int)ed.lines.size();
@@ -970,7 +1144,7 @@ Element renderEditor(const VimEditor& ed, const Palette& pal,
                                 std::to_string(total) + ")";
         return hbox({
             renderRow(ed.row),
-            text(indicator) | color(pal.muted) | dim,
+            text(indicator) | color(pal.muted),
         });
     }
 
@@ -980,6 +1154,147 @@ Element renderEditor(const VimEditor& ed, const Palette& pal,
         rows.push_back(renderRow((int)r));
     }
     return vbox(std::move(rows));
+}
+
+struct ConfigFileEditorState {
+    VimEditor editor;
+    fs::path path;
+    std::string original;
+    std::string error;
+};
+
+struct ConfigFileEditorPanel {
+    Component component;
+    std::function<void(const fs::path&)> open;
+};
+
+ConfigFileEditorPanel makeConfigFileEditorPanel(
+    Config& cfg, ScreenInteractive& screen, VimClipboard& clipboard,
+    std::function<void(bool saved, const fs::path& path)> close) {
+    auto state = std::make_shared<ConfigFileEditorState>();
+    auto sink_value = std::make_shared<std::string>();
+    auto sink = Input(sink_value.get(), "");
+
+    auto save = [state, close] {
+        std::error_code ec;
+        fs::create_directories(state->path.parent_path(), ec);
+        if (ec) {
+            state->error = "Cannot create configuration directory: " +
+                           ec.message();
+            return;
+        }
+        std::ofstream file(state->path, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            state->error = "Cannot write " + state->path.string();
+            return;
+        }
+        const std::string contents = state->editor.toString();
+        file << contents;
+        file.close();
+        if (!file) {
+            state->error = "Failed while writing " + state->path.string();
+            return;
+        }
+        state->original = contents;
+        state->error.clear();
+        close(true, state->path);
+    };
+    auto cancel = [state, close] { close(false, state->path); };
+    auto save_button = Button("Save", save);
+    auto cancel_button = Button("Cancel", cancel);
+    auto layout = Container::Vertical({
+        sink,
+        Container::Horizontal({save_button, cancel_button}),
+    });
+
+    auto events = CatchEvent(layout, [=, &clipboard](Event event) {
+        sink_value->clear();
+        if (event == Event::Custom) return false;
+        if (state->editor.mode == ChatMode::Normal) {
+            if (event == Event::Character("s")) {
+                save();
+                return true;
+            }
+            if (event == Event::Character("q")) {
+                cancel();
+                return true;
+            }
+        }
+        return handleVimEditorEvent(state->editor, clipboard, event);
+    });
+
+    auto renderer = Renderer(events, [=, &cfg, &screen] {
+        const Palette& pal = palette(cfg.theme);
+        screen.SetCursor(Screen::Cursor{0, 0, Screen::Cursor::Hidden});
+        const bool dirty = state->editor.toString() != state->original;
+        const bool insert = state->editor.mode == ChatMode::Insert;
+        const Color mode_color = insert ? pal.insert_mode : pal.normal_mode;
+        const std::string filename = state->path.filename().string();
+
+        Element title = text(" " + filename + " ") |
+                        color(pal.background) | bgcolor(pal.accent) | bold;
+        Element editor = renderEditor(state->editor, pal) |
+                         focusPositionRelative(0.f, 0.5f) | yframe | flex |
+                         color(pal.foreground);
+        Element editor_panel = window(std::move(title), std::move(editor)) |
+                               color(pal.accent) | flex;
+        Element error = state->error.empty()
+                            ? text("")
+                            : paragraph(state->error) | color(pal.error);
+        Element content = vbox({
+            banner(pal, "agent configuration"),
+            text(state->path.string()) | color(pal.muted),
+            error,
+            editor_panel,
+            hbox({
+                save_button->Render(),
+                text("  "),
+                cancel_button->Render(),
+                text(dirty ? "  modified" : "") | color(pal.normal_mode),
+                text(state->editor.clipboard_notice) |
+                    color(pal.assistant_entry) | bold,
+                filler(),
+                text(insert ? " -- INSERT -- " : " -- NORMAL -- ") |
+                    color(mode_color) | bold,
+            }),
+            text(insert
+                     ? "INSERT · type · Enter newline · Esc → NORMAL"
+                     : "NORMAL · h j k l · w b · i a o O I A · x dd · "
+                       "yy p P · gg G · s save · q cancel") |
+                color(pal.muted) | center,
+        }) | color(pal.foreground);
+        return onPaletteCanvas(
+            pal, std::move(content) | border | color(pal.border) |
+                     size(WIDTH, LESS_THAN, 110) |
+                     size(HEIGHT, LESS_THAN, std::max(10, screen.dimy())));
+    });
+
+    auto open = [state](const fs::path& path) {
+        state->path = path;
+        state->error.clear();
+        std::string contents;
+        std::ifstream file(path, std::ios::binary);
+        if (file) {
+            std::ostringstream buffer;
+            buffer << file.rdbuf();
+            if (file.bad()) {
+                state->error = "Failed while reading " + path.string();
+            } else {
+                contents = buffer.str();
+            }
+        } else {
+            std::error_code ec;
+            if (fs::exists(path, ec)) {
+                state->error = "Cannot read " + path.string();
+            } else if (ec) {
+                state->error = "Cannot inspect " + path.string() + ": " +
+                               ec.message();
+            }
+        }
+        state->editor.setText(contents);
+        state->original = contents;
+    };
+    return ConfigFileEditorPanel{renderer, open};
 }
 
 }  // namespace
@@ -996,6 +1311,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     std::thread worker;
 
     VimEditor editor;
+    VimClipboard clipboard;
     // Ctrl+Tab toggles a single-line "minimized" view of the input panel so
     // the output area takes the whole screen while the prompt buffer is kept.
     bool input_minimized = false;
@@ -1034,25 +1350,67 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         std::lock_guard<std::mutex> lk(mu);
         pushEntryLocked({TranscriptEntry::Kind::System, "welcome",
                          std::string("Workspace: ") + workspace.string() +
-                             "  ·  Provider: " + providerLabel(cfg.provider) +
-                             "  ·  Model: " + cfg.model +
+                              "  ·  Provider: OpenRouter" +
+                              "  ·  Model: " + cfg.model +
                              "  ·  Technique: " +
                              techniqueLabel(cfg.technique)});
         pushEntryLocked(
             {TranscriptEntry::Kind::System, "hints",
-             "INSERT: type freely · Enter = newline · Esc → NORMAL.   "
-             "NORMAL: Enter sends · h j k l move · w b word · 0 $ line · "
-             "gg G top/bot · i a o O I A insert · x delete · dd cut line · "
-             "Ctrl+W focus output (j/k scroll) · q quit · s settings · "
+              "INSERT: type freely · Enter = newline · Esc → NORMAL.   "
+              "NORMAL: Enter sends · h j k l move · w b word · 0 $ line · "
+              "gg G top/bot · i a o O I A insert · x delete · dd cut line · "
+              "yy copy line · p/P paste · "
+              "Ctrl+W focus output (j/k scroll) · q quit · s settings · "
              "t technique · c clear · z toggle min."});
     }
 
-    enum class Next { Quit, OpenSettings };
-    Next next = Next::Quit;
-
-    while (true) {
     auto screen = ScreenInteractive::Fullscreen();
-    next = Next::Quit;
+
+    // Settings render as a modal layered over the chat screen (ftxui::Modal)
+    // rather than tearing this screen down for a separate ScreenInteractive —
+    // one active screen, no alternate-buffer swap, no flash. `settings_open`
+    // toggles the overlay; `settings_mode` is the panel's own NORMAL/INSERT
+    // state, surfaced in its footer.
+    bool settings_open = false;
+    bool file_editor_open = false;
+    ChatMode settings_mode = ChatMode::Normal;
+
+    // Hide the modal and, on Save, note the new config in the transcript. The
+    // panel writes straight into `cfg`, so AgentContext picks it up on the next
+    // turn (it is rebuilt from `cfg` in send_turn).
+    auto close_settings = [&](bool changed) {
+        settings_open = false;
+        settings_mode = ChatMode::Normal;
+        if (changed) {
+            std::lock_guard<std::mutex> lk(mu);
+            pushEntryLocked(
+                {TranscriptEntry::Kind::System, "settings",
+                 std::string("Now using OpenRouter / ") + cfg.model + " / " +
+                     techniqueLabel(cfg.technique)});
+        }
+    };
+    auto close_file_editor = [&](bool saved, const fs::path& path) {
+        file_editor_open = false;
+        if (saved) {
+            std::lock_guard<std::mutex> lk(mu);
+            pushEntryLocked(
+                {TranscriptEntry::Kind::System, "configuration",
+                 "Saved " + path.string() +
+                     "; changes apply to the next turn."});
+        }
+    };
+    auto file_editor =
+        makeConfigFileEditorPanel(cfg, screen, clipboard, close_file_editor);
+    auto settings = makeSettingsPanel(
+        cfg, screen, settings_mode, close_settings,
+        [&] {
+            file_editor.open(agent_config_dir / "tools.md");
+            file_editor_open = true;
+        },
+        [&] {
+            file_editor.open(agent_config_dir / "skills.md");
+            file_editor_open = true;
+        });
 
     auto send_turn = [&](std::string prompt) {
         if (busy.exchange(true)) return;
@@ -1097,8 +1455,9 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                  "Cannot open settings while a turn is in progress."});
             return;
         }
-        next = Next::OpenSettings;
-        screen.ExitLoopClosure()();
+        settings.sync();
+        settings_mode = ChatMode::Normal;
+        settings_open = true;
     };
     auto clear_transcript = [&] {
         std::lock_guard<std::mutex> lk(mu);
@@ -1124,28 +1483,8 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         // Clear sink_value continuously so the hidden input never accumulates.
         sink_value.clear();
 
-        if (editor.mode == ChatMode::Insert) {
-            if (e == Event::Escape) {
-                editor.mode = ChatMode::Normal;
-                editor.clampCursor();
-                return true;
-            }
-            if (e == Event::Return) { editor.insertNewline(); return true; }
-            if (e == Event::Backspace) { editor.backspace(); return true; }
-            if (e == Event::Delete) { editor.deleteCharUnder(); return true; }
-            if (e == Event::ArrowLeft)  { editor.moveLeft();  return true; }
-            if (e == Event::ArrowRight) { editor.moveRight(); return true; }
-            if (e == Event::ArrowUp)    { editor.moveUp();    return true; }
-            if (e == Event::ArrowDown)  { editor.moveDown();  return true; }
-            if (e == Event::Home)       { editor.lineStart(); return true; }
-            if (e == Event::End)        { editor.lineEnd();   return true; }
-            if (e == Event::Tab) { editor.insertString("    "); return true; }
-            if (e.is_character()) {
-                editor.insertString(e.character());
-                return true;
-            }
-            return true;
-        }
+        if (editor.mode == ChatMode::Insert)
+            return handleVimEditorEvent(editor, clipboard, e);
 
         // ---- Normal mode ----
         // When control is on the output panel, j/k scroll it and the editing
@@ -1167,7 +1506,6 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             if (e == Event::Character("g")) { output_scroll = 0.f; return true; }
             if (e == Event::Character("G")) { output_scroll = 1.f; return true; }
             if (e == Event::Character("q")) {
-                next = Next::Quit;
                 screen.ExitLoopClosure()();
                 return true;
             }
@@ -1187,76 +1525,15 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             return true;
         }
 
-        // Two-key motions: pending_op stores the leader.
-        if (!editor.pending_op.empty()) {
-            std::string op = editor.pending_op;
+        if (e == Event::Return) {
             editor.pending_op.clear();
-            if (op == "d" && e == Event::Character("d")) {
-                editor.deleteLine();
-                return true;
-            }
-            if (op == "g" && e == Event::Character("g")) {
-                editor.firstLine();
-                return true;
-            }
-            // Any other key: fall through and re-process below.
-        }
-
-        if (e == Event::Return) { submit_buffer(); return true; }
-        if (e == Event::Escape) { return true; }
-
-        // Cursor motions
-        if (e == Event::Character("h") || e == Event::ArrowLeft) {
-            editor.moveLeft(); return true;
-        }
-        if (e == Event::Character("l") || e == Event::ArrowRight) {
-            editor.moveRight(); return true;
-        }
-        if (e == Event::Character("j") || e == Event::ArrowDown) {
-            editor.moveDown(); return true;
-        }
-        if (e == Event::Character("k") || e == Event::ArrowUp) {
-            editor.moveUp(); return true;
-        }
-        if (e == Event::Character("0") || e == Event::Home) {
-            editor.lineStart(); return true;
-        }
-        if (e == Event::Character("$") || e == Event::End) {
-            editor.lineEnd(); return true;
-        }
-        if (e == Event::Character("w")) { editor.wordForward(); return true; }
-        if (e == Event::Character("b")) { editor.wordBack();    return true; }
-        if (e == Event::Character("G")) { editor.lastLine();    return true; }
-
-        // Editing
-        if (e == Event::Character("x")) { editor.deleteCharUnder(); return true; }
-        if (e == Event::Character("o")) { editor.openLineBelow();   return true; }
-        if (e == Event::Character("O")) { editor.openLineAbove();   return true; }
-        if (e == Event::Character("i")) {
-            editor.mode = ChatMode::Insert; editor.clampCursor(); return true;
-        }
-        if (e == Event::Character("a")) {
-            editor.mode = ChatMode::Insert;
-            if (editor.col < (int)editor.lines[editor.row].size()) ++editor.col;
-            editor.clampCursor();
+            submit_buffer();
             return true;
         }
-        if (e == Event::Character("I")) {
-            editor.mode = ChatMode::Insert; editor.col = 0; return true;
-        }
-        if (e == Event::Character("A")) {
-            editor.mode = ChatMode::Insert;
-            editor.col = (int)editor.lines[editor.row].size();
-            return true;
-        }
-
-        // Leaders for 2-key motions
-        if (e == Event::Character("d")) { editor.pending_op = "d"; return true; }
-        if (e == Event::Character("g")) { editor.pending_op = "g"; return true; }
+        if (handleVimEditorEvent(editor, clipboard, e)) return true;
 
         // App commands (override the vim equivalents we don't implement)
         if (e == Event::Character("q")) {
-            next = Next::Quit;
             screen.ExitLoopClosure()();
             return true;
         }
@@ -1274,6 +1551,17 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
 
     auto renderer = Renderer(root, [&] {
         const Palette& pal = palette(cfg.theme);
+
+        // The chat editor paints its own block cursor (an `inverted` cell), and
+        // the only FTXUI component in the tree is the hidden `sink` Input, which
+        // is never rendered — so *nothing* positions the real terminal cursor.
+        // Left alone, FTXUI re-emits a show-cursor escape (\x1b[?25h) with the
+        // Screen's default-constructed, uninitialized cursor shape every frame,
+        // which surfaces as a stray blinking cursor parked in a stale cell. That
+        // is the "white/flashing" artifact the VimEditor was built to avoid but
+        // didn't fully kill. Pin the hardware cursor to Hidden here; no
+        // focusCursor node exists in this tree to override it, so it stays gone.
+        screen.SetCursor(Screen::Cursor{0, 0, Screen::Cursor::Hidden});
 
         std::vector<Element> rendered;
         {
@@ -1306,14 +1594,14 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                 : output_focused
                 ? "OUTPUT  ·  j k scroll  ·  g G top/bottom  ·  Ctrl+W → input"
                 : "NORMAL  ·  Enter send  ·  h j k l move  ·  w b word  ·  "
-                  "i a o O I A insert  ·  x dd  ·  z min  ·  Ctrl+W output  ·  "
-                  "q s t c";
+                  "i a o O I A insert  ·  x dd  ·  yy p P  ·  z min  ·  "
+                  "Ctrl+W output  ·  q s t c";
 
-        Element header_bar =
+        Element header_content =
             hbox({
                 text("OVI-CODE") | bold | color(pal.accent),
                 text("  "),
-                text(providerLabel(cfg.provider)) | color(pal.muted),
+                text("OpenRouter") | color(pal.muted),
                 text(" · "),
                 text(cfg.model) | color(pal.muted),
                 text(" · "),
@@ -1322,30 +1610,41 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                 text(mode_tag) | color(mode_color) | bold,
                 text(" "),
                 text(status) | color(status_color) | bold,
-            }) |
+            }) | color(pal.foreground);
+        Element header_bar =
+            std::move(header_content) |
             borderRounded | color(pal.border);
 
         Element output_panel =
             window(hbox({
-                       text(" output ") | color(pal.accent) | bold,
-                       text(output_focused ? "[SCROLL · j/k]" : "") |
-                           color(pal.normal_mode),
-                   }),
-                   scroll) |
+                       text(" output ") |
+                           color(output_focused ? pal.background : pal.accent) |
+                           bgcolor(output_focused ? pal.accent : pal.background) |
+                           bold,
+                        text(output_focused ? "[SCROLL · j/k]" : "") |
+                            color(pal.normal_mode),
+                    }),
+                   std::move(scroll) | color(pal.foreground)) |
             color(output_focused ? pal.accent : pal.border) | flex;
 
         Element input_body = input_minimized
             ? renderEditor(editor, pal, true)
             : renderEditor(editor, pal, false) |
                   focusPositionRelative(0.f, 1.f) | yframe;
+        input_body |= color(pal.foreground);
 
         Element input_panel =
             window(hbox({
-                       text(" input ") | color(pal.accent) | bold,
-                       text(insert ? "[INSERT]" : "[NORMAL]") |
-                           color(mode_color),
-                       text(input_minimized ? "  [MIN]" : "") |
-                           color(pal.muted),
+                       text(" input ") |
+                           color(output_focused ? pal.accent : pal.background) |
+                           bgcolor(output_focused ? pal.background : pal.accent) |
+                           bold,
+                        text(insert ? "[INSERT]" : "[NORMAL]") |
+                            color(mode_color),
+                        text(editor.clipboard_notice) |
+                            color(pal.assistant_entry) | bold,
+                        text(input_minimized ? "  [MIN]" : "") |
+                            color(pal.muted),
                    }),
                    input_body) |
             color(pal.border);
@@ -1360,31 +1659,26 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             ? input_panel | size(HEIGHT, EQUAL, 3)
             : input_panel | size(HEIGHT, GREATER_THAN, 8);
 
-        return vbox({
-                   header_bar,
-                   output_panel,
-                   input_panel,
-                   text(footer) | color(pal.muted) | dim | center,
-               }) |
-               flex;
+        return onPaletteCanvas(
+            pal, vbox({
+                     header_bar,
+                     output_panel,
+                     input_panel,
+                     text(footer) | color(pal.muted) | center,
+                 }) |
+                     flex);
     });
 
-    screen.Loop(renderer);
+    // Keep every overlay in this screen. The file editor is layered above
+    // Settings so closing it returns to the same configuration form.
+    auto settings_app = Modal(renderer, settings.component, &settings_open);
+    auto app = Modal(settings_app, file_editor.component, &file_editor_open);
+
+    screen.Loop(app);
     if (worker.joinable()) {
         stop_requested.store(true);
         worker.join();
         stop_requested.store(false);
-    }
-    if (next == Next::OpenSettings) {
-        runSettingsScreen(cfg);
-        std::lock_guard<std::mutex> lk(mu);
-        pushEntryLocked(
-            {TranscriptEntry::Kind::System, "settings",
-             std::string("Now using ") + providerLabel(cfg.provider) + " / " +
-                 cfg.model + " / " + techniqueLabel(cfg.technique)});
-        continue;
-    }
-    break;
     }
 }
 

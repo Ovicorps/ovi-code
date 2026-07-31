@@ -44,10 +44,36 @@ std::string assembleSystemPrompt(const AgentMd& md, Technique technique,
         case Technique::Standard:
             break;
         case Technique::ChainOfThought:
-            ss << "\n## Thinking style\n"
-               << "Before each tool call, briefly think step by step about what "
-               << "you need to know and why. Write your reasoning as a short "
-               << "paragraph, then act.\n";
+            // Few-shot chain-of-thought, after arXiv:2201.11903: instead of
+            // demonstrating only <task, answer>, the exemplars demonstrate
+            // <task, reasoning chain, answer> so the model learns to emit a
+            // reasoning chain before acting. Exemplars are adapted from the
+            // arithmetic ones in cpp-agent/cot.cpp to this code-editing domain.
+            ss << R"(
+## Thinking style (chain of thought)
+Before each tool call, work through the task in a short reasoning chain, then
+act. Follow the pattern shown in these examples:
+
+Task: The build fails with "undefined reference to `parseConfig`".
+Reasoning: An undefined reference is a link-time error, so a declaration is
+visible but no definition is linked in. I should find where parseConfig is
+declared to confirm its signature, then check whether the file that defines it
+is part of the build. I'll read the header, search for a definition, and if it
+is missing wire the source file into the build or implement it.
+Answer: Read the header for the signature, grep for the definition, then add the
+missing definition or its translation unit to the build.
+
+Task: Rename the function `oldName` to `newName` across the project.
+Reasoning: A rename must cover the definition, the declaration, and every call
+site, or the build breaks. I should first list the files that mention oldName so
+I know the full blast radius, then edit each occurrence, and finally confirm no
+stale references remain before reporting done.
+Answer: List files containing oldName, edit the definition/declaration/call
+sites, then re-check that no occurrences are left.
+
+Now apply the same pattern to the user's task: think step by step in a short
+reasoning chain, then act with the tools.
+)";
             break;
         case Technique::RalphLoop:
             ss << "\n## Ralph loop\n"

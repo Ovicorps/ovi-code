@@ -2,10 +2,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <system_error>
-#include <unordered_set>
+#include <unordered_map>
 
 #include "ovicode/tools.hpp"
 
@@ -83,39 +84,41 @@ std::string humanizeToolResult(const ToolCall& tc, const ToolResult& r) {
     return truncated(r.content, 20, 2000);
 }
 
-std::vector<std::string> keywords(const std::string& s) {
-    static const std::unordered_set<std::string> stop = {
-        "the", "a", "an", "to", "in", "of", "and", "or", "is", "are", "for",
-        "with", "on", "this", "that", "it", "be", "as", "by", "do", "from",
-        "we", "you", "i", "me", "my", "your", "our", "us", "can", "will",
-        "should", "would", "could", "what", "how", "why", "when", "where",
-        "but", "not", "so", "if", "then", "else", "into", "out", "up", "down",
-        "use", "make", "add", "create", "remove", "delete", "fix", "update",
-    };
+std::vector<std::string> tokenize(const std::string& s) {
     std::vector<std::string> out;
     std::string cur;
     for (char c : s) {
         if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
-            cur.push_back(static_cast<char>(std::tolower(c)));
+            cur.push_back(static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c))));
         } else {
-            if (cur.size() >= 3 && !stop.count(cur)) out.push_back(cur);
+            if (cur.size() >= 3) out.push_back(cur);
             cur.clear();
         }
     }
-    if (cur.size() >= 3 && !stop.count(cur)) out.push_back(cur);
+    if (cur.size() >= 3) out.push_back(cur);
     return out;
 }
 
+// TF-IDF / cosine retrieval over the workspace, mirroring the DPR + MIPS
+// stand-in retriever from arXiv:2005.11401 (see cpp-agent/rag.cpp): tokenize
+// each candidate file, build an IDF table across the corpus, then rank files by
+// cosine similarity between the query's TF-IDF vector and each file's. Unlike a
+// raw keyword count, IDF down-weights terms common to many files (language
+// keywords, boilerplate) so distinctive matches float to the top.
 std::string ragContext(const fs::path& workspace, const std::string& query,
                        size_t max_files, size_t max_bytes_per_file) {
-    auto kws = keywords(query);
-    if (kws.empty()) return {};
-    std::error_code ec;
-    struct Hit {
+    auto qtokens = tokenize(query);
+    if (qtokens.empty()) return {};
+
+    struct Doc {
         fs::path path;
-        int score;
+        std::unordered_map<std::string, double> tf;  // term -> raw count
     };
-    std::vector<Hit> hits;
+    std::vector<Doc> docs;
+    std::unordered_map<std::string, int> df;  // term -> document frequency
+
+    std::error_code ec;
     for (auto it = fs::recursive_directory_iterator(
              workspace, fs::directory_options::skip_permission_denied, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
@@ -135,18 +138,62 @@ std::string ragContext(const fs::path& workspace, const std::string& query,
         if (!f) continue;
         std::string body((std::istreambuf_iterator<char>(f)),
                          std::istreambuf_iterator<char>());
-        std::string lower = body;
-        std::transform(lower.begin(), lower.end(), lower.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        int score = 0;
-        for (const auto& k : kws) {
-            size_t pos = 0;
-            while ((pos = lower.find(k, pos)) != std::string::npos) {
-                ++score;
-                pos += k.size();
-            }
+        Doc doc;
+        doc.path = path;
+        for (const auto& t : tokenize(body)) doc.tf[t] += 1.0;
+        if (doc.tf.empty()) continue;
+        for (const auto& kv : doc.tf) df[kv.first] += 1;
+        docs.push_back(std::move(doc));
+    }
+    if (docs.empty()) return {};
+
+    const double n = static_cast<double>(docs.size());
+    std::unordered_map<std::string, double> idf;
+    for (const auto& kv : df) {
+        idf[kv.first] = std::log((1.0 + n) / (1.0 + kv.second)) + 1.0;
+    }
+
+    // Project raw term counts into a TF-IDF vector and report its L2 norm.
+    auto vectorize = [&](const std::unordered_map<std::string, double>& tf,
+                         double& vnorm) {
+        std::unordered_map<std::string, double> v;
+        double sum = 0.0;
+        for (const auto& kv : tf) {
+            auto it = idf.find(kv.first);
+            double w = kv.second * (it == idf.end() ? 1.0 : it->second);
+            v[kv.first] = w;
+            sum += w * w;
         }
-        if (score > 0) hits.push_back({path, score});
+        vnorm = std::sqrt(sum);
+        return v;
+    };
+
+    std::unordered_map<std::string, double> qtf;
+    for (const auto& t : qtokens) qtf[t] += 1.0;
+    double qnorm = 0.0;
+    auto qvec = vectorize(qtf, qnorm);
+    if (qnorm == 0.0) return {};
+
+    struct Hit {
+        fs::path path;
+        double score;
+    };
+    std::vector<Hit> hits;
+    for (const auto& doc : docs) {
+        double dnorm = 0.0;
+        auto dvec = vectorize(doc.tf, dnorm);
+        if (dnorm == 0.0) continue;
+        // Cosine similarity, iterating over the smaller vector.
+        const auto* small = &qvec;
+        const auto* large = &dvec;
+        if (small->size() > large->size()) std::swap(small, large);
+        double dot = 0.0;
+        for (const auto& kv : *small) {
+            auto it = large->find(kv.first);
+            if (it != large->end()) dot += kv.second * it->second;
+        }
+        double sim = dot / (qnorm * dnorm);
+        if (sim > 0.0) hits.push_back({doc.path, sim});
     }
     std::sort(hits.begin(), hits.end(),
               [](const Hit& a, const Hit& b) { return a.score > b.score; });
@@ -154,7 +201,7 @@ std::string ragContext(const fs::path& workspace, const std::string& query,
     if (hits.empty()) return {};
 
     std::ostringstream ss;
-    ss << "Retrieved excerpts (keyword scored):\n";
+    ss << "Retrieved excerpts (TF-IDF cosine scored):\n";
     for (const auto& h : hits) {
         std::ifstream f(h.path);
         std::string body((std::istreambuf_iterator<char>(f)),
@@ -163,8 +210,12 @@ std::string ragContext(const fs::path& workspace, const std::string& query,
             body.resize(max_bytes_per_file);
             body += "\n...[truncated]";
         }
+        std::ostringstream score;
+        score << std::fixed;
+        score.precision(3);
+        score << h.score;
         ss << "\n--- " << fs::relative(h.path, workspace).string()
-           << " (score " << h.score << ") ---\n"
+           << " (score " << score.str() << ") ---\n"
            << body << "\n";
     }
     return ss.str();
@@ -184,7 +235,7 @@ bool runReactLoop(const AgentContext& ctx, std::vector<Message>& messages,
         req.tools = builtinTools();
         auto resp = chat(ctx.config, req);
         if (!resp.error.empty()) {
-            emit(sink, TranscriptEntry::Kind::Error, "Provider error",
+            emit(sink, TranscriptEntry::Kind::Error, "OpenRouter error",
                  resp.error);
             return false;
         }

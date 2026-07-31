@@ -18,9 +18,6 @@ struct ToolCall {
     std::string id;
     std::string name;
     nlohmann::json input;
-    // Provider-specific opaque payload that must be replayed verbatim in the
-    // next turn. Gemini uses this for `thoughtSignature` on functionCall parts.
-    std::string thought_signature;
 };
 
 struct ToolResult {
