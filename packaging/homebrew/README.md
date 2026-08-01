@@ -1,15 +1,30 @@
 # Distributing OVI-CODE via Homebrew
 
-OVI-CODE ships as a **Homebrew tap**: a small GitHub repo that holds the
-formula. Users then `brew tap` it once and `brew install ovi-code`.
+OVI-CODE ships through a **Homebrew tap** containing both a prebuilt macOS cask
+and an optional source-build formula.
 
 ```
 packaging/homebrew/
-  ovi-code.rb     # the formula (source of truth, with sha256 placeholders)
-  README.md       # this file
+  ovi-code.rb          # source-build formula template
+  ovi-code-cask.rb     # prebuilt macOS cask template
+  README.md
 scripts/
-  brew-release.sh # fills in the version + sha256s for a tagged release
+  brew-release.sh       # generates the formula
+  brew-cask-release.sh  # generates the cask from release archives
+.github/workflows/
+  release.yml           # builds arm64/x86_64 archives for every v* tag
 ```
+
+## How the cask works
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`. It builds native
+Apple Silicon and Intel binaries, packages them as `.tar.gz` archives, records
+their SHA-256 checksums, and attaches everything to a GitHub release. The cask
+selects the matching archive with Homebrew's `on_arm` / `on_intel` blocks.
+
+The source repository and its release assets must be publicly downloadable for
+public Homebrew installs. The tap repository must also exist at
+`Ovicorps/homebrew-ovi-code`.
 
 ## How the formula builds offline
 
@@ -24,35 +39,46 @@ The `resource` versions are pinned to the same `GIT_TAG`s as
 `CMakeLists.txt`. `scripts/brew-release.sh` reads those tags straight from
 `CMakeLists.txt`, so they stay in lockstep automatically.
 
-## Cutting a release
+## Cutting a cask release
 
-1. Tag and push:
+1. Update the project version in `CMakeLists.txt`, then tag and push:
 
    ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.2.0
+   git push origin v0.2.0
    ```
 
-2. Generate the filled formula (computes all three sha256s):
+2. Wait for the `Release` GitHub Actions workflow to publish both macOS
+   archives.
+
+3. Generate the cask directly into a checked-out tap:
 
    ```bash
-   scripts/brew-release.sh v0.1.0
+   scripts/brew-cask-release.sh v0.2.0 \
+     ../homebrew-ovi-code/Casks/ovi-code.rb
    ```
 
-   This rewrites `packaging/homebrew/ovi-code.rb` in place. To write straight
-   into a checked-out tap instead:
+4. Audit and test the cask:
 
    ```bash
-   scripts/brew-release.sh v0.1.0 ../homebrew-ovi-code/Formula/ovi-code.rb
-   # slug is auto-derived from `git remote get-url origin` (Ovicorps/ovi-code)
-   ```
-
-3. Smoke-test the build locally:
-
-   ```bash
-   brew install --build-from-source ./packaging/homebrew/ovi-code.rb
+   brew audit --cask --strict ../homebrew-ovi-code/Casks/ovi-code.rb
+   brew install --cask ../homebrew-ovi-code/Casks/ovi-code.rb
    ovi-code --help
    ```
+
+5. Commit and push `Casks/ovi-code.rb` in the tap.
+
+## Updating the source formula
+
+The formula remains available for users who prefer a local source build. After
+the tag is public, generate and smoke-test it with:
+
+```bash
+scripts/brew-release.sh v0.2.0 \
+  ../homebrew-ovi-code/Formula/ovi-code.rb
+brew install --build-from-source \
+  ../homebrew-ovi-code/Formula/ovi-code.rb
+```
 
 ## Publishing the tap (one-time)
 
@@ -63,24 +89,23 @@ Create a repo named `homebrew-ovi-code` under the `Ovicorps` org (the
 # on GitHub: create Ovicorps/homebrew-ovi-code, then locally:
 git clone https://github.com/Ovicorps/homebrew-ovi-code
 mkdir -p homebrew-ovi-code/Formula
-cp packaging/homebrew/ovi-code.rb homebrew-ovi-code/Formula/ovi-code.rb
-cd homebrew-ovi-code && git add Formula/ovi-code.rb && git commit -m "ovi-code 0.1.0" && git push
+mkdir -p homebrew-ovi-code/Casks
 ```
 
 ## Installing (end users)
 
 ```bash
 brew tap Ovicorps/ovi-code        # adds the Ovicorps/homebrew-ovi-code tap
-brew install ovi-code
+brew install --cask ovi-code
 ```
 
 Or in one shot without a separate tap step:
 
 ```bash
-brew install Ovicorps/ovi-code/ovi-code
+brew install --cask Ovicorps/ovi-code/ovi-code
 ```
 
-Bleeding edge from `main`:
+Build the latest `main` branch from source:
 
 ```bash
 brew install --HEAD Ovicorps/ovi-code/ovi-code

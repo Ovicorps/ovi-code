@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+          cmake --build build --parallel
+
+      - name: Verify binary
+        run: |
+          build/ovi-code --help
+          file build/ovi-code
+          otool -L build/ovi-code
+          if otool -L build/ovi-code | grep -Eq '/(opt/homebrew|usr/local)/'; then
+            echo "Binary links against a Homebrew-only library" >&2
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p stage
+          cmake --install build --prefix stage
+          tar -C stage/bin -czf "ovi-code-darwin-${{ matrix.arch }}.tar.gz" ovi-code
+          shasum -a 256 "ovi-code-darwin-${{ matrix.arch }}.tar.gz" \
+            > "ovi-code-darwin-${{ matrix.arch }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ovi-code-darwin-${{ matrix.arch }}
+          path: |
+            ovi-code-darwin-${{ matrix.arch }}.tar.gz
+            ovi-code-darwin-${{ matrix.arch }}.tar.gz.sha256
+
+  release:
+    needs: macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ovi-code-darwin-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "OVI-CODE ${GITHUB_REF_NAME}" \
+            --generate-notes
