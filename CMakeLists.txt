@@ -36,6 +36,7 @@ find_package(CURL REQUIRED)
 add_executable(ovi-code
     src/main.cpp
     src/config.cpp
+    src/plugins.cpp
     src/http.cpp
     src/providers.cpp
     src/tools.cpp
@@ -48,9 +49,26 @@ target_link_libraries(ovi-code PRIVATE
     nlohmann_json::nlohmann_json
     ftxui::component
     CURL::libcurl
+    ${CMAKE_DL_LIBS}
 )
 target_compile_options(ovi-code PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
 )
 
 install(TARGETS ovi-code RUNTIME DESTINATION bin)
+install(FILES include/ovicode/technique_plugin.h
+        DESTINATION include/ovicode)
+
+option(OVI_CODE_BUILD_EXAMPLE_PLUGINS "Build example technique plugins" ON)
+if(OVI_CODE_BUILD_EXAMPLE_PLUGINS)
+    add_library(ovi-code-deliberate MODULE plugins/examples/deliberate.cpp)
+    target_include_directories(ovi-code-deliberate PRIVATE include)
+    target_compile_options(ovi-code-deliberate PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
+    )
+    set_target_properties(ovi-code-deliberate PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "deliberate"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins"
+    )
+endif()

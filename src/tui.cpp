@@ -225,20 +225,57 @@ MenuOption highContrastMenuOption() {
     return option;
 }
 
-std::vector<std::string> techniqueLabels() {
+std::vector<std::string> techniqueIds(
+    const TechniquePluginRegistry& plugins) {
     std::vector<std::string> out;
-    for (auto t : allTechniques()) {
-        out.push_back(techniqueLabel(t) + " — " + techniqueDescription(t));
+    for (Technique technique : allTechniques())
+        out.push_back(techniqueToString(technique));
+    for (const auto& plugin : plugins.plugins()) out.push_back(plugin->id);
+    return out;
+}
+
+std::vector<std::string> techniqueLabels(
+    const TechniquePluginRegistry& plugins) {
+    std::vector<std::string> out;
+    for (Technique technique : allTechniques()) {
+        out.push_back(techniqueLabel(technique) + " — " +
+                      techniqueDescription(technique));
+    }
+    for (const auto& plugin : plugins.plugins()) {
+        out.push_back(plugin->label + " [plugin] — " + plugin->description);
     }
     return out;
 }
 
-int indexOfTechnique(Technique t) {
-    const auto& list = allTechniques();
-    for (size_t i = 0; i < list.size(); ++i) {
-        if (list[i] == t) return static_cast<int>(i);
+int indexOfTechniqueId(const std::vector<std::string>& ids,
+                       const std::string& id) {
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] == id) return static_cast<int>(i);
     }
-    return 0;
+    return -1;
+}
+
+void selectTechnique(Config& cfg, const std::string& id) {
+    cfg.technique_id = id;
+    for (Technique technique : allTechniques()) {
+        if (techniqueToString(technique) == id) {
+            cfg.technique = technique;
+            return;
+        }
+    }
+    cfg.technique = Technique::Standard;
+}
+
+std::string selectedTechniqueLabel(
+    const Config& cfg, const TechniquePluginRegistry& plugins) {
+    const std::string id = cfg.technique_id.empty()
+                               ? techniqueToString(cfg.technique)
+                               : cfg.technique_id;
+    if (const auto* plugin = plugins.find(id)) return plugin->label;
+    for (Technique technique : allTechniques()) {
+        if (techniqueToString(technique) == id) return techniqueLabel(technique);
+    }
+    return "Missing plugin: " + id;
 }
 
 int indexOfModel(const std::vector<std::string>& models,
@@ -247,6 +284,38 @@ int indexOfModel(const std::vector<std::string>& models,
         if (models[i] == m) return static_cast<int>(i);
     }
     return -1;
+}
+
+std::string reasoningEffortChoiceLabel(const std::string& model,
+                                       ReasoningEffort effort) {
+    if (effort != ReasoningEffort::Auto) return reasoningEffortLabel(effort);
+    const ModelInfo* info = findModelInfo(model);
+    if (info && info->auto_effort != ReasoningEffort::Auto) {
+        return "Auto — model default: " +
+               reasoningEffortLabel(info->auto_effort);
+    }
+    return "Auto — model managed";
+}
+
+int indexOfReasoningEffort(const std::vector<ReasoningEffort>& options,
+                           ReasoningEffort effort) {
+    for (size_t i = 0; i < options.size(); ++i) {
+        if (options[i] == effort) return static_cast<int>(i);
+    }
+    return 0;
+}
+
+void refreshReasoningEffortChoices(
+    const std::string& model, ReasoningEffort selected,
+    std::vector<ReasoningEffort>& options, std::vector<std::string>& choices,
+    int& selected_index) {
+    options = reasoningEffortOptions(model);
+    choices.clear();
+    choices.reserve(options.size());
+    for (ReasoningEffort effort : options) {
+        choices.push_back(reasoningEffortChoiceLabel(model, effort));
+    }
+    selected_index = indexOfReasoningEffort(options, selected);
 }
 
 Element banner(const Palette& pal, const std::string& title) {
@@ -346,20 +415,33 @@ Element blockCursorInput(const Component& input) {
 
 // -- Setup wizard -----------------------------------------------------------
 
-bool runSetupWizard(Config& cfg) {
+bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
     clearTerminal();
     auto screen = ScreenInteractive::TerminalOutput();
 
-    int step = 0;  // 0=OpenRouter key, 1=model, 2=technique
-    int technique_idx = indexOfTechnique(cfg.technique);
+    int step = 0;  // 0=OpenRouter key, 1=model, 2=effort, 3=technique
+    auto technique_ids = techniqueIds(plugins);
+    const std::string configured_technique =
+        cfg.technique_id.empty() ? techniqueToString(cfg.technique)
+                                 : cfg.technique_id;
+    int technique_idx =
+        indexOfTechniqueId(technique_ids, configured_technique);
+    if (technique_idx < 0) {
+        technique_ids.push_back(configured_technique);
+        technique_idx = static_cast<int>(technique_ids.size()) - 1;
+    }
     std::string api_key = cfg.openrouter_api_key;
     std::string model = cfg.model.empty() ? defaultModel() : cfg.model;
+    ReasoningEffort effort = cfg.reasoning_effort;
     bool aborted = false;
     bool finished = false;
     // Start in NORMAL so j/k drive the menus immediately; i/a edits inputs.
     ChatMode mode = ChatMode::Normal;
 
-    auto technique_choices = techniqueLabels();
+    auto technique_choices = techniqueLabels(plugins);
+    if (technique_choices.size() < technique_ids.size()) {
+        technique_choices.push_back("Missing plugin: " + configured_technique);
+    }
 
     InputOption key_opts = paletteInputOption(cfg);
     key_opts.password = true;
@@ -373,6 +455,14 @@ bool runSetupWizard(Config& cfg) {
         Menu(&model_choices, &model_idx, highContrastMenuOption());
     auto model_input = Input(&model, "", paletteInputOption(cfg));
 
+    std::vector<ReasoningEffort> effort_options;
+    std::vector<std::string> effort_choices;
+    int effort_idx = 0;
+    refreshReasoningEffortChoices(model, effort, effort_options,
+                                  effort_choices, effort_idx);
+    auto effort_menu =
+        Menu(&effort_choices, &effort_idx, highContrastMenuOption());
+
     auto technique_menu =
         Menu(&technique_choices, &technique_idx, highContrastMenuOption());
 
@@ -384,8 +474,13 @@ bool runSetupWizard(Config& cfg) {
                 model_idx < static_cast<int>(model_choices.size()) - 1) {
                 model = model_choices[model_idx];
             }
+            refreshReasoningEffortChoices(model, effort, effort_options,
+                                          effort_choices, effort_idx);
             ++step;
         } else if (step == 2) {
+            effort = effort_options[effort_idx];
+            ++step;
+        } else if (step == 3) {
             finished = true;
             screen.ExitLoopClosure()();
         }
@@ -404,6 +499,7 @@ bool runSetupWizard(Config& cfg) {
         {
             key_input,
             Container::Vertical({model_menu, model_input}),
+            effort_menu,
             technique_menu,
         },
         &step);
@@ -438,9 +534,22 @@ bool runSetupWizard(Config& cfg) {
                 text(""),
                 hbox({text("Custom model: "), blockCursorInput(model_input)}),
             });
+        } else if (step == 2) {
+            body = vbox({
+                text("3. Choose reasoning effort") | bold |
+                    color(pal.accent),
+                separator(),
+                effort_menu->Render() | frame |
+                    size(HEIGHT, LESS_THAN, 10),
+                text(""),
+                paragraph(
+                    "Only effort levels supported by the selected model are "
+                    "shown. Auto follows that model's OpenRouter default.") |
+                    color(pal.muted),
+            });
         } else {
             body = vbox({
-                text("3. Choose default agentic technique") | bold |
+                text("4. Choose default agentic technique") | bold |
                     color(pal.accent),
                 separator(),
                 technique_menu->Render() | frame |
@@ -471,7 +580,7 @@ bool runSetupWizard(Config& cfg) {
                                                    : pal.normal_mode) |
                     bold,
                 text("  "),
-                text("step " + std::to_string(step + 1) + "/3") |
+                text("step " + std::to_string(step + 1) + "/4") |
                     color(pal.muted),
             }),
             text(mode == ChatMode::Insert
@@ -502,7 +611,8 @@ bool runSetupWizard(Config& cfg) {
         cfg.model = defaultModel();
     }
     cfg.openrouter_api_key = api_key;
-    cfg.technique = allTechniques()[technique_idx];
+    cfg.reasoning_effort = effort;
+    selectTechnique(cfg, technique_ids[technique_idx]);
     return true;
 }
 
@@ -517,8 +627,12 @@ struct SettingsState {
     int technique_idx = 0;
     int theme_idx = 0;
     int model_idx = 0;
-    std::string api_key, model, max_iters_s, ralph_s, temp_s;
-    std::vector<std::string> technique_choices, theme_choices, model_choices;
+    int effort_idx = 0;
+    std::string api_key, model, max_iters_s, ralph_s, plugin_iters_s, temp_s;
+    std::string effort_model;
+    std::vector<ReasoningEffort> effort_options;
+    std::vector<std::string> technique_ids, technique_choices, theme_choices,
+        model_choices, effort_choices;
 };
 
 // The settings panel as an embeddable modal: `component` is layered over the
@@ -538,9 +652,11 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                                  ChatMode& mode,
                                  std::function<void(bool changed)> close,
                                  std::function<void()> edit_tools,
-                                 std::function<void()> edit_skills) {
+                                 std::function<void()> edit_skills,
+                                 const TechniquePluginRegistry& plugins) {
     auto st = std::make_shared<SettingsState>();
-    st->technique_choices = techniqueLabels();
+    st->technique_ids = techniqueIds(plugins);
+    st->technique_choices = techniqueLabels(plugins);
     for (auto t : allThemes())
         st->theme_choices.push_back(themeLabel(t) + " — " +
                                     themeDescription(t));
@@ -551,6 +667,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
     auto technique_menu = Radiobox(&st->technique_choices, &st->technique_idx);
     auto theme_menu = Radiobox(&st->theme_choices, &st->theme_idx);
     auto model_menu = Radiobox(&st->model_choices, &st->model_idx);
+    auto effort_menu = Radiobox(&st->effort_choices, &st->effort_idx);
     auto model_input =
         Input(&st->model, "model id", paletteInputOption(cfg));
 
@@ -561,13 +678,41 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         Input(&st->max_iters_s, "max tool iters", paletteInputOption(cfg));
     auto ralph_input = Input(&st->ralph_s, "ralph iterations",
                              paletteInputOption(cfg));
+    auto plugin_iters_input = Input(&st->plugin_iters_s, "plugin iterations",
+                                    paletteInputOption(cfg));
     auto temp_input =
         Input(&st->temp_s, "temperature", paletteInputOption(cfg));
 
+    auto current_model = [st] {
+        if (st->model_idx >= 0 &&
+            st->model_idx < static_cast<int>(st->model_choices.size()) - 1) {
+            return st->model_choices[st->model_idx];
+        }
+        return st->model;
+    };
+    auto refresh_effort = [st, current_model](ReasoningEffort selected) {
+        st->effort_model = current_model();
+        refreshReasoningEffortChoices(
+            st->effort_model, selected, st->effort_options,
+            st->effort_choices, st->effort_idx);
+    };
+
     // Re-read every field from the live config. Called once now to initialise
     // and again by the caller each time the panel is reopened.
-    auto sync = [st, &cfg] {
-        st->technique_idx = indexOfTechnique(cfg.technique);
+    auto sync = [st, &cfg, &plugins, refresh_effort] {
+        st->technique_ids = techniqueIds(plugins);
+        st->technique_choices = techniqueLabels(plugins);
+        const std::string technique_id =
+            cfg.technique_id.empty() ? techniqueToString(cfg.technique)
+                                     : cfg.technique_id;
+        st->technique_idx =
+            indexOfTechniqueId(st->technique_ids, technique_id);
+        if (st->technique_idx < 0) {
+            st->technique_ids.push_back(technique_id);
+            st->technique_choices.push_back("Missing plugin: " + technique_id);
+            st->technique_idx =
+                static_cast<int>(st->technique_ids.size()) - 1;
+        }
         st->theme_idx = 0;
         const auto& themes = allThemes();
         for (size_t i = 0; i < themes.size(); ++i)
@@ -576,6 +721,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         st->model = cfg.model;
         st->max_iters_s = std::to_string(cfg.max_tool_iterations);
         st->ralph_s = std::to_string(cfg.ralph_iterations);
+        st->plugin_iters_s = std::to_string(cfg.plugin_iterations);
         st->temp_s = std::to_string(cfg.temperature);
         st->model_choices = knownModels();
         st->model_choices.push_back("(custom — type below)");
@@ -583,6 +729,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         if (st->model_idx < 0) {
             st->model_idx = static_cast<int>(st->model_choices.size()) - 1;
         }
+        refresh_effort(cfg.reasoning_effort);
     };
     sync();
 
@@ -594,7 +741,11 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
             cfg.model = st->model;
         }
         cfg.openrouter_api_key = st->api_key;
-        cfg.technique = allTechniques()[st->technique_idx];
+        if (st->effort_idx >= 0 &&
+            st->effort_idx < static_cast<int>(st->effort_options.size())) {
+            cfg.reasoning_effort = st->effort_options[st->effort_idx];
+        }
+        selectTechnique(cfg, st->technique_ids[st->technique_idx]);
         if (st->theme_idx >= 0 &&
             st->theme_idx < static_cast<int>(allThemes().size())) {
             cfg.theme = allThemes()[st->theme_idx];
@@ -605,6 +756,11 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         }
         try {
             cfg.ralph_iterations = std::max(1, std::stoi(st->ralph_s));
+        } catch (...) {
+        }
+        try {
+            cfg.plugin_iterations =
+                std::max(1, std::stoi(st->plugin_iters_s));
         } catch (...) {
         }
         try {
@@ -622,11 +778,13 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
     auto layout = Container::Vertical({
         model_menu,
         model_input,
+        effort_menu,
         key_input,
         technique_menu,
         theme_menu,
         iters_input,
         ralph_input,
+        plugin_iters_input,
         temp_input,
         tools_button,
         skills_button,
@@ -635,6 +793,14 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
 
     auto renderer = Renderer(layout, [=, &cfg, &screen, &mode] {
         const Palette& pal = palette(cfg.theme);
+        if (current_model() != st->effort_model) {
+            ReasoningEffort selected = ReasoningEffort::Auto;
+            if (st->effort_idx >= 0 &&
+                st->effort_idx < static_cast<int>(st->effort_options.size())) {
+                selected = st->effort_options[st->effort_idx];
+            }
+            refresh_effort(selected);
+        }
         // Default the hardware cursor to Hidden every frame; blockCursorInput
         // re-shows a steady block only on the *focused* Input (its focusCursor
         // node runs later in the same draw). Without this reset the cursor
@@ -654,6 +820,10 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                     text("OpenRouter model") | bold | color(pal.accent),
                     model_menu->Render() | frame | size(HEIGHT, LESS_THAN, 10),
                     hbox({text("Custom: "), blockCursorInput(model_input)}),
+                    text(""),
+                    text("Reasoning effort") | bold | color(pal.accent),
+                    effort_menu->Render() | frame |
+                        size(HEIGHT, LESS_THAN, 8),
                 }) | flex,
                 separator(),
                 vbox({
@@ -671,6 +841,8 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                           blockCursorInput(iters_input)}),
                     hbox({text("Ralph iters:    "),
                           blockCursorInput(ralph_input)}),
+                    hbox({text("Plugin passes:  "),
+                          blockCursorInput(plugin_iters_input)}),
                     hbox({text("Temperature:    "),
                           blockCursorInput(temp_input)}),
                     text(""),
@@ -1300,8 +1472,9 @@ ConfigFileEditorPanel makeConfigFileEditorPanel(
 }  // namespace
 
 void runChatScreen(Config& cfg, const fs::path& workspace,
-                   const fs::path& agent_config_dir) {
-    AgentContext ctx{cfg, loadAgentMd(agent_config_dir), workspace};
+                   const fs::path& agent_config_dir,
+                   const TechniquePluginRegistry& plugins) {
+    AgentContext ctx{cfg, loadAgentMd(agent_config_dir), workspace, &plugins};
     std::vector<Message> messages;
 
     std::mutex mu;
@@ -1349,11 +1522,18 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     {
         std::lock_guard<std::mutex> lk(mu);
         pushEntryLocked({TranscriptEntry::Kind::System, "welcome",
-                         std::string("Workspace: ") + workspace.string() +
-                              "  ·  Provider: OpenRouter" +
-                              "  ·  Model: " + cfg.model +
-                             "  ·  Technique: " +
-                             techniqueLabel(cfg.technique)});
+                          std::string("Workspace: ") + workspace.string() +
+                               "  ·  Provider: OpenRouter" +
+                               "  ·  Model: " + cfg.model +
+                              "  ·  Effort: " +
+                              reasoningEffortLabel(effectiveReasoningEffort(
+                                  cfg.model, cfg.reasoning_effort)) +
+                              "  ·  Technique: " +
+                              selectedTechniqueLabel(cfg, plugins)});
+        for (const auto& error : plugins.errors()) {
+            pushEntryLocked(
+                {TranscriptEntry::Kind::Error, "plugin loader", error});
+        }
         pushEntryLocked(
             {TranscriptEntry::Kind::System, "hints",
               "INSERT: type freely · Enter = newline · Esc → NORMAL.   "
@@ -1386,7 +1566,9 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             pushEntryLocked(
                 {TranscriptEntry::Kind::System, "settings",
                  std::string("Now using OpenRouter / ") + cfg.model + " / " +
-                     techniqueLabel(cfg.technique)});
+                     reasoningEffortLabel(effectiveReasoningEffort(
+                         cfg.model, cfg.reasoning_effort)) + " effort / " +
+                     selectedTechniqueLabel(cfg, plugins)});
         }
     };
     auto close_file_editor = [&](bool saved, const fs::path& path) {
@@ -1410,7 +1592,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         [&] {
             file_editor.open(agent_config_dir / "skills.md");
             file_editor_open = true;
-        });
+        }, plugins);
 
     auto send_turn = [&](std::string prompt) {
         if (busy.exchange(true)) return;
@@ -1439,13 +1621,17 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     };
 
     auto cycle_technique = [&] {
-        const auto& list = allTechniques();
-        int idx = indexOfTechnique(cfg.technique);
-        cfg.technique = list[(idx + 1) % list.size()];
+        const auto ids = techniqueIds(plugins);
+        const std::string current =
+            cfg.technique_id.empty() ? techniqueToString(cfg.technique)
+                                     : cfg.technique_id;
+        int idx = indexOfTechniqueId(ids, current);
+        selectTechnique(cfg, ids[(idx + 1) % ids.size()]);
         std::lock_guard<std::mutex> lk(mu);
         pushEntryLocked(
             {TranscriptEntry::Kind::System, "technique",
-             std::string("Switched to ") + techniqueLabel(cfg.technique)});
+             std::string("Switched to ") +
+                 selectedTechniqueLabel(cfg, plugins)});
     };
     auto open_settings = [&] {
         if (busy.load()) {
@@ -1605,7 +1791,12 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                 text(" · "),
                 text(cfg.model) | color(pal.muted),
                 text(" · "),
-                text(techniqueLabel(cfg.technique)) | color(pal.technique),
+                text(reasoningEffortLabel(effectiveReasoningEffort(
+                         cfg.model, cfg.reasoning_effort)) + " effort") |
+                    color(pal.muted),
+                text(" · "),
+                text(selectedTechniqueLabel(cfg, plugins)) |
+                    color(pal.technique),
                 filler(),
                 text(mode_tag) | color(mode_color) | bold,
                 text(" "),

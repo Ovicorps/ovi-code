@@ -10,6 +10,8 @@ in a full-screen TUI.
 - [Quick Start](#quick-start)
 - [Using The TUI](#using-the-tui)
 - [Agentic Techniques](#agentic-techniques)
+- [Technique Plugins](#technique-plugins)
+- [Curated Models And Effort](#curated-models-and-effort)
 - [Project Instructions](#project-instructions)
 - [Command Reference](#command-reference)
 - [Tools And Safety](#tools-and-safety)
@@ -22,10 +24,12 @@ in a full-screen TUI.
 
 - Full-screen, keyboard-driven terminal interface built with FTXUI.
 - Vim-style multiline prompt and configuration-file editors.
-- OpenRouter model picker with support for custom model IDs.
+- OpenRouter model picker with capability-aware reasoning effort and support
+  for custom model IDs.
 - Visible model responses, tool calls, tool results, and file diffs.
 - Workspace-sandboxed file tools.
 - Standard ReAct, Chain of Thought, Ralph Loop, and RAG techniques.
+- Runtime-loaded C++ modules for user-defined agentic techniques.
 - Project instructions through `agent.md`, `tools.md`, and `skills.md`.
 - Dark, light, system, and high-contrast plain themes.
 - Native Apple Silicon and Intel Homebrew cask packaging.
@@ -78,11 +82,12 @@ For a source build, run:
 ./build/ovi-code
 ```
 
-The first launch opens a three-step setup wizard:
+The first launch opens a four-step setup wizard:
 
 1. Enter your OpenRouter API key.
 2. Select an OpenRouter model or enter a custom model ID.
-3. Select the default agentic technique.
+3. Select a reasoning effort supported by that model.
+4. Select the default agentic technique.
 
 The configuration is saved to `~/.ovi-code/config.json` with permissions set
 to `0600`.
@@ -221,10 +226,12 @@ the next agent turn and saved when the application exits.
 Settings include:
 
 - OpenRouter model and API key.
+- Reasoning effort filtered to the selected model's capabilities.
 - Agentic technique.
 - Theme.
 - Maximum tool iterations.
 - Ralph Loop iterations.
+- Maximum ReAct passes per plugin turn.
 - Temperature.
 - Built-in editors for `tools.md` and `skills.md`.
 
@@ -255,6 +262,166 @@ turn.
 
 Press `t` in Normal mode to cycle techniques quickly, or choose one in
 Settings.
+
+## Technique Plugins
+
+Technique plugins are native C++ dynamic libraries loaded when OVI-CODE starts.
+They add entries to the setup wizard, Settings, and the `t` technique cycle
+without recompiling or relinking the application.
+
+> **Warning:** A plugin is native code with the same permissions as OVI-CODE.
+> It is not sandboxed and can read files, access the network, or execute other
+> processes. Install only plugins whose source and publisher you trust.
+
+### Discovering Plugins
+
+OVI-CODE loads `.dylib` and `.so` modules from:
+
+```text
+~/.ovi-code/plugins
+```
+
+Use another directory with either form:
+
+```bash
+ovi-code --plugin-dir /path/to/plugins
+OVI_CODE_PLUGIN_DIR=/path/to/plugins ovi-code
+```
+
+List loaded modules and loader errors without opening the TUI:
+
+```bash
+ovi-code plugins
+ovi-code plugins --plugin-dir ./build/plugins
+```
+
+Plugins are discovered once at process startup. Restart OVI-CODE after adding
+or rebuilding a module. A configured plugin that is missing or fails to load is
+reported as an error and is never silently replaced by a built-in technique.
+
+### Building The Example
+
+The source tree includes `plugins/examples/deliberate.cpp`. It is built by
+default with the application:
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+./build/ovi-code plugins --plugin-dir ./build/plugins
+./build/ovi-code --plugin-dir ./build/plugins
+```
+
+Select **Deliberate [plugin]** during setup or from Settings.
+
+### Writing A Plugin
+
+Plugins include the public, dependency-free ABI header:
+
+```cpp
+#include "ovicode/technique_plugin.h"
+
+#include <string>
+
+namespace {
+
+int runTurn(void*, const OviCodeTechniqueHostV1* host,
+            const char* user_input) {
+    if (!host || !host->run_react || !user_input) return 0;
+
+    std::string system = host->base_system_prompt;
+    system += "\n\nCheck assumptions before every tool call.";
+    return host->run_react(host->context, system.c_str(), user_input);
+}
+
+const OviCodeTechniquePluginV1 plugin{
+    OVI_CODE_TECHNIQUE_PLUGIN_API_VERSION,
+    "verify-first",
+    "Verify First",
+    "Checks assumptions before acting",
+    nullptr,
+    nullptr,
+    runTurn,
+};
+
+}  // namespace
+
+extern "C" const OviCodeTechniquePluginV1*
+ovi_code_get_technique_plugin_v1() {
+    return &plugin;
+}
+```
+
+Build it on macOS:
+
+```bash
+c++ -std=c++20 -dynamiclib -I/path/to/ovi-code/include \
+  verify_first.cpp -o ~/.ovi-code/plugins/verify-first.dylib
+```
+
+Build it on Linux:
+
+```bash
+c++ -std=c++20 -shared -fPIC -I/path/to/ovi-code/include \
+  verify_first.cpp -o ~/.ovi-code/plugins/verify-first.so
+```
+
+Create `~/.ovi-code/plugins` first if it does not exist. Plugin IDs must start
+with a lowercase letter or digit and contain only lowercase letters, digits,
+`.`, `_`, or `-`. They must not duplicate built-in or previously loaded IDs.
+
+### Runtime Interface
+
+The exported `ovi_code_get_technique_plugin_v1` function returns one
+`OviCodeTechniquePluginV1` descriptor. The versioned C ABI keeps module loading
+consistent while allowing plugin implementations to use C++ internally.
+
+| Field or callback | Purpose |
+| --- | --- |
+| `id`, `label`, `description` | Metadata shown and persisted by OVI-CODE |
+| `create` / `destroy` | Optional process-lifetime plugin state |
+| `run_turn` | Entry point for each user turn |
+| `host->workspace` | Absolute active workspace path |
+| `host->base_system_prompt` | Standard prompt plus project instruction files |
+| `host->run_react` | Add a user message and run one complete model/tool pass |
+| `host->last_assistant_text` | Inspect the latest response for loop stop conditions |
+| `host->emit` | Write System or Error status to the transcript |
+| `host->iteration_limit` | Maximum host-enforced ReAct passes for this turn |
+
+A plugin can call `run_react` more than once to implement refinement, critic,
+or Ralph-style loops. The host stops calls beyond the **Plugin passes** setting.
+Callbacks and input pointers are valid only during `run_turn`; copy any data
+that must be retained. Do not allow C++ exceptions to cross the exported ABI.
+
+The current ABI version and exact declarations are in
+[`include/ovicode/technique_plugin.h`](include/ovicode/technique_plugin.h).
+
+## Curated Models And Effort
+
+The curated picker includes the latest Fable, Opus 5, and GPT-5.6 variants
+reported by OpenRouter:
+
+| Family | Model IDs |
+| --- | --- |
+| Claude Fable | `anthropic/claude-fable-5`, `~anthropic/claude-fable-latest` |
+| Claude Opus 5 | `anthropic/claude-opus-5`, `anthropic/claude-opus-5-fast` |
+| GPT-5.6 Sol | `openai/gpt-5.6-sol`, `openai/gpt-5.6-sol-pro` |
+| GPT-5.6 Terra | `openai/gpt-5.6-terra`, `openai/gpt-5.6-terra-pro` |
+| GPT-5.6 Luna | `openai/gpt-5.6-luna`, `openai/gpt-5.6-luna-pro` |
+
+Reasoning effort is sent through OpenRouter's normalized
+`reasoning.effort` parameter. The available choices change with the selected
+model:
+
+- Fable and Opus 5 expose Max, Extra high, High, Medium, and Low.
+- GPT-5.6 variants expose Max, Extra high, High, Medium, Low, and None.
+- Other curated models expose only the levels listed by OpenRouter.
+- Models without selectable reasoning and unknown custom IDs expose only Auto.
+
+Auto follows model capabilities. It selects High for Fable and Opus 5, Medium
+for GPT-5.6 and mandatory-reasoning models, and leaves optional reasoning
+model-managed when OpenRouter does not enable it by default. If a saved effort
+is not supported after changing models, OVI-CODE falls back to that model's
+Auto behavior instead of sending an invalid value.
 
 ## Project Instructions
 
@@ -289,6 +456,7 @@ ovi-code [command] [options]
 | Command | Description |
 | --- | --- |
 | `init` | Run setup, save the configuration, and exit |
+| `plugins` | List loaded runtime technique plugins and loader errors |
 | `uninstall` | Remove the saved configuration and exit |
 
 ### Options
@@ -298,8 +466,10 @@ ovi-code [command] [options]
 | `--workspace <dir>` | Set the workspace root; defaults to the current directory |
 | `--agent-config-dir <dir>` | Set the directory containing `agent.md`, `tools.md`, and `skills.md` |
 | `--config <file>` | Use a custom application configuration path |
+| `--plugin-dir <dir>` | Load runtime technique plugins from another directory |
 | `--setup` | Run the setup wizard again |
 | `--init` | Alias for the `init` command |
+| `--list-plugins` | Alias for the `plugins` command |
 | `--uninstall` | Alias for the `uninstall` command |
 | `--no-splash` | Skip the startup splash screen |
 | `-h`, `--help` | Display command-line help |
@@ -309,6 +479,7 @@ ovi-code [command] [options]
 | Variable | Description |
 | --- | --- |
 | `OPENROUTER_API_KEY` | Override the saved OpenRouter API key |
+| `OVI_CODE_PLUGIN_DIR` | Override the runtime technique plugin directory |
 | `NO_COLOR` | Disable colors in the startup splash |
 | `COLORFGBG` | Help automatic theme detection determine terminal brightness |
 

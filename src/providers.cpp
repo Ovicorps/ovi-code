@@ -115,6 +115,10 @@ json messagesAsOpenAI(const ChatRequest& req) {
                     }
                     item["tool_calls"] = std::move(calls);
                 }
+                if (message.reasoning_details.is_array() &&
+                    !message.reasoning_details.empty()) {
+                    item["reasoning_details"] = message.reasoning_details;
+                }
                 messages.push_back(std::move(item));
                 break;
             }
@@ -158,7 +162,18 @@ ChatResponse chat(const Config& cfg, const ChatRequest& req) {
         {"stream", false},
     };
     if (cfg.max_tokens > 0) body["max_tokens"] = cfg.max_tokens;
-    if (cfg.temperature >= 0.0) body["temperature"] = cfg.temperature;
+    const ModelInfo* model_info = findModelInfo(cfg.model);
+    if (cfg.temperature >= 0.0 &&
+        (!model_info || model_info->supports_temperature)) {
+        body["temperature"] = cfg.temperature;
+    }
+    const ReasoningEffort effort =
+        effectiveReasoningEffort(cfg.model, cfg.reasoning_effort);
+    if (effort != ReasoningEffort::Auto) {
+        body["reasoning"] = {
+            {"effort", reasoningEffortToString(effort)},
+        };
+    }
     if (!req.tools.empty()) body["tools"] = toolsAsOpenAI(req.tools);
 
     const auto response = http::post(
@@ -202,6 +217,10 @@ ChatResponse chat(const Config& cfg, const ChatRequest& req) {
     out.raw_finish_reason = choice.value("finish_reason", "");
     if (message.contains("content") && message["content"].is_string()) {
         out.text = message["content"].get<std::string>();
+    }
+    if (message.contains("reasoning_details") &&
+        message["reasoning_details"].is_array()) {
+        out.reasoning_details = message["reasoning_details"];
     }
     if (message.contains("tool_calls") && message["tool_calls"].is_array()) {
         for (const auto& item : message["tool_calls"]) {

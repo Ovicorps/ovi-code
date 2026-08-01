@@ -245,6 +245,7 @@ bool runReactLoop(const AgentContext& ctx, std::vector<Message>& messages,
         assistant.role = Message::Role::Assistant;
         assistant.text = resp.text;
         assistant.tool_calls = resp.tool_calls;
+        assistant.reasoning_details = resp.reasoning_details;
         messages.push_back(assistant);
 
         if (!resp.text.empty()) {
@@ -278,10 +279,115 @@ bool runReactLoop(const AgentContext& ctx, std::vector<Message>& messages,
     return false;
 }
 
+struct PluginHostContext {
+    const AgentContext& agent;
+    std::vector<Message>& messages;
+    const TranscriptSink& sink;
+    std::string last_assistant_text;
+    bool cancelled = false;
+    int react_runs = 0;
+};
+
+void updateLastAssistantText(PluginHostContext& context) {
+    context.last_assistant_text.clear();
+    for (auto it = context.messages.rbegin(); it != context.messages.rend();
+         ++it) {
+        if (it->role == Message::Role::Assistant) {
+            context.last_assistant_text = it->text;
+            return;
+        }
+    }
+}
+
+int pluginEmit(void* opaque, OviCodePluginMessageKindV1 kind,
+               const char* title, const char* body);
+
+int pluginRunReact(void* opaque, const char* system_prompt,
+                   const char* user_input) {
+    auto& context = *static_cast<PluginHostContext*>(opaque);
+    if (!user_input || context.cancelled) return 0;
+    if (context.react_runs >= context.agent.config.plugin_iterations) {
+        pluginEmit(&context, OVI_CODE_PLUGIN_MESSAGE_ERROR, "Technique plugin",
+                   "Plugin exceeded its configured ReAct pass limit.");
+        return 0;
+    }
+    ++context.react_runs;
+
+    Message user;
+    user.role = Message::Role::User;
+    user.text = user_input;
+    context.messages.push_back(user);
+    if (!emit(context.sink, TranscriptEntry::Kind::User, "you", user.text)) {
+        context.cancelled = true;
+        return 0;
+    }
+
+    const std::string prompt =
+        system_prompt && *system_prompt
+            ? std::string(system_prompt)
+            : assembleSystemPrompt(context.agent.md, Technique::Standard,
+                                   context.agent.workspace);
+    const bool ok = runReactLoop(context.agent, context.messages, prompt,
+                                 context.sink);
+    updateLastAssistantText(context);
+    return ok ? 1 : 0;
+}
+
+const char* pluginLastAssistantText(void* opaque) {
+    auto& context = *static_cast<PluginHostContext*>(opaque);
+    return context.last_assistant_text.c_str();
+}
+
+int pluginEmit(void* opaque, OviCodePluginMessageKindV1 kind,
+               const char* title, const char* body) {
+    auto& context = *static_cast<PluginHostContext*>(opaque);
+    const auto entry_kind = kind == OVI_CODE_PLUGIN_MESSAGE_ERROR
+                                ? TranscriptEntry::Kind::Error
+                                : TranscriptEntry::Kind::System;
+    const bool keep_running =
+        emit(context.sink, entry_kind, title ? title : "plugin",
+             body ? body : "");
+    if (!keep_running) context.cancelled = true;
+    return keep_running ? 1 : 0;
+}
+
 }  // namespace
 
 void runTurn(const AgentContext& ctx, std::vector<Message>& messages,
              const std::string& user_input, const TranscriptSink& sink) {
+    const std::string technique_id =
+        ctx.config.technique_id.empty()
+            ? techniqueToString(ctx.config.technique)
+            : ctx.config.technique_id;
+    const LoadedTechniquePlugin* plugin =
+        ctx.plugins ? ctx.plugins->find(technique_id) : nullptr;
+    if (plugin) {
+        const std::string base_system_prompt = assembleSystemPrompt(
+            ctx.md, Technique::Standard, ctx.workspace);
+        const std::string workspace = ctx.workspace.string();
+        PluginHostContext host_context{ctx, messages, sink, "", false, 0};
+        OviCodeTechniqueHostV1 host{
+            OVI_CODE_TECHNIQUE_PLUGIN_API_VERSION,
+            &host_context,
+            workspace.c_str(),
+            base_system_prompt.c_str(),
+            ctx.config.plugin_iterations,
+            pluginRunReact,
+            pluginLastAssistantText,
+            pluginEmit,
+        };
+        if (!plugin->run(host, user_input) && !host_context.cancelled) {
+            emit(sink, TranscriptEntry::Kind::Error, plugin->label,
+                 "Technique plugin failed the turn.");
+        }
+        return;
+    }
+    if (technique_id != techniqueToString(ctx.config.technique)) {
+        emit(sink, TranscriptEntry::Kind::Error, "Technique plugin",
+             "Configured plugin '" + technique_id + "' is not loaded.");
+        return;
+    }
+
     std::string system_prompt =
         assembleSystemPrompt(ctx.md, ctx.config.technique, ctx.workspace);
 

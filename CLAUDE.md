@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cmake -S . -B build         # first configure fetches FTXUI + nlohmann/json (~30s)
 cmake --build build -j      # incremental rebuilds; binary at build/ovi-code
-./build/ovi-code             # launches TUI; first run drops into the 3-step setup wizard
+./build/ovi-code             # launches TUI; first run drops into the 4-step setup wizard
 ./build/ovi-code --setup     # force re-run the setup wizard
 ./build/ovi-code --workspace <dir> --agent-config-dir <dir>
 OPENROUTER_API_KEY=... ./build/ovi-code  # env override for the saved key
@@ -25,13 +25,14 @@ Single-process C++20 binary. Layering, bottom-up:
 - **`tools.{hpp,cpp}`** — three workspace-sandboxed tools (`read_file`, `list_files`, `edit_file`) and their JSON Schemas. `edit_file` enforces unique-occurrence matching; empty `old_str` means "create new file". `resolveInside()` is the only path-traversal guard — every tool must route through it.
 - **`providers.{hpp,cpp}`** — OpenRouter chat-completions client. The internal `ChatRequest` / `ChatResponse` / `Message` types remain wire-format agnostic; this layer translates them to OpenAI-compatible messages and tool calls for OpenRouter.
 - **`agent_md.{hpp,cpp}`** — loads `agent.md` / `tools.md` / `skills.md` from the workspace (or `--agent-config-dir`) and assembles the system prompt. Technique-specific prefaces are layered in here.
+- **`plugins.{hpp,cpp}` / `technique_plugin.h`** — runtime loader and versioned C ABI for user-defined C++ technique modules. Plugins are loaded from `~/.ovi-code/plugins` (or `--plugin-dir`) and drive turns through host callbacks without linking against app internals.
 - **`react.{hpp,cpp}`** — the ReAct loop. `runTurn()` is the entry point; it handles all four techniques:
   - `Standard` — straight ReAct loop capped by `max_tool_iterations`.
   - `ChainOfThought` — adds a "think step by step" preface.
   - `RalphLoop` — wraps the ReAct loop and re-injects the goal up to `ralph_iterations` times; stops early when the assistant emits `DONE`.
   - `Rag` — runs a keyword grep over the workspace and prepends matches as a synthetic user message *before* the real user turn.
-- **`tui.{hpp,cpp}`** — FTXUI. Two screens: `runSetupWizard` (3 steps, its own `TerminalOutput` screen) and `runChatScreen`. Settings are no longer a separate screen — `makeSettingsPanel` builds them as an embeddable component that `runChatScreen` layers over the chat with `ftxui::Modal`.
-- **`config.{hpp,cpp}`** — `Config` struct, technique/theme enums, JSON load/save, and the curated OpenRouter model list.
+- **`tui.{hpp,cpp}`** — FTXUI. Two screens: `runSetupWizard` (4 steps, its own `TerminalOutput` screen) and `runChatScreen`. Settings are no longer a separate screen — `makeSettingsPanel` builds them as an embeddable component that `runChatScreen` layers over the chat with `ftxui::Modal`.
+- **`config.{hpp,cpp}`** — `Config` struct, technique/theme/reasoning-effort enums, JSON load/save, and the curated OpenRouter model capability list.
 - **`main.cpp`** — arg parsing + setup-or-chat dispatch.
 
 The `Config` struct is mutated live by the settings screen and re-saved on quit. `AgentContext` (config + loaded `agent.md` + workspace path) is rebuilt at the start of every turn so workspace `.md` edits and settings changes take effect immediately.
@@ -44,7 +45,7 @@ The `Config` struct is mutated live by the settings screen and re-saved on quit.
 - **Don't add raw `Color::*` constants in `tui.cpp`.** All chrome colors live in the `Palette` struct near the top of `tui.cpp` (dark + light variants) and are resolved per-render via `palette(cfg.theme)`. Auto-detection reads `$COLORFGBG`. New UI elements should pick a semantic slot (`pal.accent`, `pal.muted`, `pal.error`, etc.) rather than hard-coding a color — otherwise the light theme breaks. Transcript entry colors come from `kindColor(pal, kind)`.
 - **Transcript is bounded.** `runChatScreen` keeps at most ~1000 entries (`kTranscriptHardCap`); when it overflows it drops the oldest in one batch and inserts an "elided" system note. All push sites go through `pushEntryLocked` (caller holds `mu`). If you add a new code path that writes to the transcript, use the helper — direct `transcript.push_back` will silently bypass the cap.
 - **OpenRouter is the only provider.** Add curated model IDs to `knownModels()` in `config.cpp`; users can enter any other OpenRouter model ID through the custom model field.
-- **Adding a new technique** means: add to `Technique` enum + `technique*` helpers + `allTechniques()` in `config.cpp`, add a preamble case in `assembleSystemPrompt()` in `agent_md.cpp`, and (if the technique alters control flow like RalphLoop/Rag) branch on it in `runTurn()` in `react.cpp`. The setup wizard and settings screen pick it up automatically via `allTechniques()` / `techniqueLabel()`.
+- **Adding a built-in technique** means: add to `Technique` enum + `technique*` helpers + `allTechniques()` in `config.cpp`, add a preamble case in `assembleSystemPrompt()` in `agent_md.cpp`, and (if the technique alters control flow like RalphLoop/Rag) branch on it in `runTurn()` in `react.cpp`. User-defined techniques should instead implement `technique_plugin.h`; the setup wizard and Settings discover them at runtime.
 - **`builtinTools()` is the only tool registry.** Anything new needs a `ToolDefinition` there plus a handler branch in `executeTool()`. OpenRouter picks it up automatically because requests serialize from the same list.
 
 ## Why no cpr

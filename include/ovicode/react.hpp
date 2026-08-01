@@ -7,6 +7,7 @@
 
 #include "ovicode/agent_md.hpp"
 #include "ovicode/config.hpp"
+#include "ovicode/plugins.hpp"
 #include "ovicode/providers.hpp"
 
 namespace ovicode {
@@ -22,6 +23,7 @@ struct AgentContext {
     Config config;
     AgentMd md;
     std::filesystem::path workspace;
+    const TechniquePluginRegistry* plugins = nullptr;
 };
 
 // Callback fired as new transcript entries are produced — lets the TUI render

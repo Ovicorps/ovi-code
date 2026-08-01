@@ -114,19 +114,130 @@ const std::vector<Theme>& allThemes() {
     return v;
 }
 
-const std::vector<std::string>& knownModels() {
-    static const std::vector<std::string> models = {
-        "anthropic/claude-sonnet-4.6",
-        "anthropic/claude-opus-4.6",
-        "anthropic/claude-haiku-4.5",
-        "openai/gpt-5.4",
-        "openai/gpt-5.4-mini",
-        "google/gemini-3.1-pro-preview",
-        "google/gemini-3-flash-preview",
-        "deepseek/deepseek-v3.2",
-        "qwen/qwen3-coder",
-        "openai/gpt-oss-120b",
+std::string reasoningEffortLabel(ReasoningEffort effort) {
+    switch (effort) {
+        case ReasoningEffort::Auto:    return "Auto";
+        case ReasoningEffort::Max:     return "Max";
+        case ReasoningEffort::XHigh:   return "Extra high";
+        case ReasoningEffort::High:    return "High";
+        case ReasoningEffort::Medium:  return "Medium";
+        case ReasoningEffort::Low:     return "Low";
+        case ReasoningEffort::Minimal: return "Minimal";
+        case ReasoningEffort::None:    return "None";
+    }
+    return "Auto";
+}
+
+std::string reasoningEffortToString(ReasoningEffort effort) {
+    switch (effort) {
+        case ReasoningEffort::Auto:    return "auto";
+        case ReasoningEffort::Max:     return "max";
+        case ReasoningEffort::XHigh:   return "xhigh";
+        case ReasoningEffort::High:    return "high";
+        case ReasoningEffort::Medium:  return "medium";
+        case ReasoningEffort::Low:     return "low";
+        case ReasoningEffort::Minimal: return "minimal";
+        case ReasoningEffort::None:    return "none";
+    }
+    return "auto";
+}
+
+ReasoningEffort reasoningEffortFromString(const std::string& value) {
+    if (value == "max") return ReasoningEffort::Max;
+    if (value == "xhigh") return ReasoningEffort::XHigh;
+    if (value == "high") return ReasoningEffort::High;
+    if (value == "medium") return ReasoningEffort::Medium;
+    if (value == "low") return ReasoningEffort::Low;
+    if (value == "minimal") return ReasoningEffort::Minimal;
+    if (value == "none") return ReasoningEffort::None;
+    return ReasoningEffort::Auto;
+}
+
+const std::vector<ModelInfo>& knownModelInfo() {
+    using E = ReasoningEffort;
+    static const std::vector<ModelInfo> models = {
+        {"anthropic/claude-sonnet-4.6",
+         {E::Max, E::High, E::Medium, E::Low}, E::Auto},
+        {"anthropic/claude-opus-5",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low}, E::High},
+        {"anthropic/claude-opus-5-fast",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low}, E::High, false},
+        {"anthropic/claude-fable-5",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low}, E::High, false},
+        {"~anthropic/claude-fable-latest",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low}, E::High, false},
+        {"anthropic/claude-opus-4.6",
+         {E::Max, E::High, E::Medium, E::Low}, E::Auto},
+        {"anthropic/claude-haiku-4.5", {}, E::Auto},
+        {"openai/gpt-5.6-sol",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low, E::None}, E::Medium,
+         false},
+        {"openai/gpt-5.6-sol-pro",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low, E::None}, E::Medium,
+         false},
+        {"openai/gpt-5.6-terra",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low, E::None}, E::Medium,
+         false},
+        {"openai/gpt-5.6-terra-pro",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low, E::None}, E::Medium,
+         false},
+        {"openai/gpt-5.6-luna",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low, E::None}, E::Medium,
+         false},
+        {"openai/gpt-5.6-luna-pro",
+         {E::Max, E::XHigh, E::High, E::Medium, E::Low, E::None}, E::Medium,
+         false},
+        {"openai/gpt-5.4",
+         {E::XHigh, E::High, E::Medium, E::Low, E::None}, E::Auto, false},
+        {"openai/gpt-5.4-mini",
+         {E::XHigh, E::High, E::Medium, E::Low, E::None}, E::Auto, false},
+        {"google/gemini-3.1-pro-preview",
+         {E::High, E::Medium, E::Low}, E::Medium},
+        {"google/gemini-3-flash-preview",
+         {E::High, E::Medium, E::Low, E::Minimal}, E::Auto},
+        {"deepseek/deepseek-v3.2", {}, E::Auto},
+        {"qwen/qwen3-coder", {}, E::Auto},
+        {"openai/gpt-oss-120b",
+         {E::High, E::Medium, E::Low}, E::Medium},
     };
+    return models;
+}
+
+const ModelInfo* findModelInfo(const std::string& model) {
+    for (const auto& info : knownModelInfo()) {
+        if (info.id == model) return &info;
+    }
+    return nullptr;
+}
+
+std::vector<ReasoningEffort> reasoningEffortOptions(const std::string& model) {
+    std::vector<ReasoningEffort> options{ReasoningEffort::Auto};
+    const ModelInfo* info = findModelInfo(model);
+    if (info) {
+        options.insert(options.end(), info->supported_efforts.begin(),
+                       info->supported_efforts.end());
+    }
+    return options;
+}
+
+ReasoningEffort effectiveReasoningEffort(const std::string& model,
+                                         ReasoningEffort configured) {
+    const ModelInfo* info = findModelInfo(model);
+    if (!info || info->supported_efforts.empty()) return ReasoningEffort::Auto;
+    if (configured == ReasoningEffort::Auto) return info->auto_effort;
+    for (ReasoningEffort supported : info->supported_efforts) {
+        if (supported == configured) return configured;
+    }
+    return info->auto_effort;
+}
+
+const std::vector<std::string>& knownModels() {
+    static const std::vector<std::string> models = [] {
+        std::vector<std::string> ids;
+        ids.reserve(knownModelInfo().size());
+        for (const auto& info : knownModelInfo()) ids.push_back(info.id);
+        return ids;
+    }();
     return models;
 }
 
@@ -189,10 +300,14 @@ std::optional<Config> loadConfig(const fs::path& path) {
         else if (provider == "cerebras" && c.model == "gpt-oss-120b")
             c.model = "openai/" + c.model;
     }
-    c.technique = techniqueFromString(j.value("technique", "standard"));
+    c.technique_id = j.value("technique", std::string("standard"));
+    c.technique = techniqueFromString(c.technique_id);
     c.theme = themeFromString(j.value("theme", "plain"));
+    c.reasoning_effort = reasoningEffortFromString(
+        j.value("reasoning_effort", std::string("auto")));
     c.max_tool_iterations = j.value("max_tool_iterations", 12);
     c.ralph_iterations = j.value("ralph_iterations", 3);
+    c.plugin_iterations = j.value("plugin_iterations", 3);
     c.max_tokens = j.value("max_tokens", 4096);
     c.temperature = j.value("temperature", 0.2);
     return c;
@@ -204,10 +319,14 @@ bool saveConfig(const Config& cfg, const fs::path& path) {
     json j = {
         {"model", cfg.model},
         {"openrouter_api_key", cfg.openrouter_api_key},
-        {"technique", techniqueToString(cfg.technique)},
+        {"technique", cfg.technique_id.empty()
+                          ? techniqueToString(cfg.technique)
+                          : cfg.technique_id},
         {"theme", themeToString(cfg.theme)},
+        {"reasoning_effort", reasoningEffortToString(cfg.reasoning_effort)},
         {"max_tool_iterations", cfg.max_tool_iterations},
         {"ralph_iterations", cfg.ralph_iterations},
+        {"plugin_iterations", cfg.plugin_iterations},
         {"max_tokens", cfg.max_tokens},
         {"temperature", cfg.temperature},
     };

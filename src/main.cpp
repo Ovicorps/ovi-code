@@ -9,6 +9,7 @@
 
 #include "ovicode/agent_md.hpp"
 #include "ovicode/config.hpp"
+#include "ovicode/plugins.hpp"
 #include "ovicode/tui.hpp"
 
 namespace {
@@ -18,6 +19,7 @@ namespace fs = std::filesystem;
 enum class Command {
     Run,
     Init,
+    Plugins,
     Uninstall,
 };
 
@@ -25,6 +27,7 @@ struct Args {
     fs::path workspace;
     fs::path agent_config_dir;
     fs::path config_path;
+    fs::path plugin_dir;
     Command command = Command::Run;
     bool show_help = false;
     bool reconfigure = false;
@@ -103,6 +106,7 @@ void printHelp() {
         "\n"
         "Commands:\n"
         "  init                       Run setup, save config, and exit\n"
+        "  plugins                    List runtime technique plugins\n"
         "  uninstall                  Remove saved config and exit\n"
         "\n"
         "Options:\n"
@@ -111,14 +115,18 @@ void printHelp() {
         "                             skills.md from (default: workspace)\n"
         "  --config <file>            Path to ovi-code config.json\n"
         "                             (default: ~/.ovi-code/config.json)\n"
+        "  --plugin-dir <dir>         Runtime C++ technique plugins\n"
+        "                             (default: ~/.ovi-code/plugins)\n"
         "  --setup                    Force the setup wizard to run\n"
         "  --init                     Alias for the init command\n"
+        "  --list-plugins             Alias for the plugins command\n"
         "  --uninstall                Alias for the uninstall command\n"
         "  --no-splash                Skip the ASCII splash screen\n"
         "  -h, --help                 Show this help\n"
         "\n"
         "Environment overrides:\n"
-        "  OPENROUTER_API_KEY         Overrides the saved OpenRouter API key.\n";
+        "  OPENROUTER_API_KEY         Overrides the saved OpenRouter API key.\n"
+        "  OVI_CODE_PLUGIN_DIR        Overrides the technique plugin directory.\n";
 }
 
 Args parseArgs(int argc, char** argv) {
@@ -146,6 +154,8 @@ Args parseArgs(int argc, char** argv) {
             a.show_help = true;
         } else if (s == "init" || s == "--init") {
             selectCommand(Command::Init, s);
+        } else if (s == "plugins" || s == "--list-plugins") {
+            selectCommand(Command::Plugins, s);
         } else if (s == "uninstall" || s == "--uninstall") {
             selectCommand(Command::Uninstall, s);
         } else if (s == "--workspace") {
@@ -154,6 +164,8 @@ Args parseArgs(int argc, char** argv) {
             a.agent_config_dir = fs::path(take("--agent-config-dir"));
         } else if (s == "--config") {
             a.config_path = fs::path(take("--config"));
+        } else if (s == "--plugin-dir") {
+            a.plugin_dir = fs::path(take("--plugin-dir"));
         } else if (s == "--setup") {
             a.reconfigure = true;
         } else if (s == "--no-splash") {
@@ -165,6 +177,13 @@ Args parseArgs(int argc, char** argv) {
         }
     }
     if (a.agent_config_dir.empty()) a.agent_config_dir = a.workspace;
+    if (a.plugin_dir.empty()) {
+        if (const char* env = std::getenv("OVI_CODE_PLUGIN_DIR"); env && *env) {
+            a.plugin_dir = env;
+        } else {
+            a.plugin_dir = ovicode::defaultConfigDir() / "plugins";
+        }
+    }
     return a;
 }
 
@@ -211,13 +230,29 @@ int main(int argc, char** argv) {
         return uninstallConfig(args.config_path);
     }
 
-    if (args.show_splash && stdoutIsTty()) {
+    if (args.command == Command::Run && args.show_splash && stdoutIsTty()) {
         printSplash(colorAllowed());
     }
 
     std::error_code ec;
     args.workspace = fs::absolute(args.workspace, ec);
     args.agent_config_dir = fs::absolute(args.agent_config_dir, ec);
+    args.plugin_dir = fs::absolute(args.plugin_dir, ec);
+
+    ovicode::TechniquePluginRegistry plugins;
+    plugins.loadDirectory(args.plugin_dir);
+    if (args.command == Command::Plugins) {
+        std::cout << "Technique plugin directory: " << args.plugin_dir << "\n";
+        for (const auto& plugin : plugins.plugins()) {
+            std::cout << "  " << plugin->id << "\t" << plugin->label << " — "
+                      << plugin->description << "\n";
+        }
+        if (plugins.plugins().empty()) std::cout << "  (no plugins loaded)\n";
+        for (const auto& error : plugins.errors()) {
+            std::cerr << "Plugin error: " << error << "\n";
+        }
+        return plugins.errors().empty() ? 0 : 1;
+    }
 
     ovicode::migrateLegacyConfig(args.config_path);
     auto maybe_cfg = ovicode::loadConfig(args.config_path);
@@ -230,7 +265,7 @@ int main(int argc, char** argv) {
 
     if (!maybe_cfg.has_value() || cfg.openrouter_api_key.empty() ||
         args.reconfigure || init_only) {
-        if (!ovicode::runSetupWizard(cfg)) {
+        if (!ovicode::runSetupWizard(cfg, plugins)) {
             std::cerr << "Setup cancelled.\n";
             return 1;
         }
@@ -249,7 +284,7 @@ int main(int argc, char** argv) {
         cfg.model = ovicode::defaultModel();
     }
 
-    ovicode::runChatScreen(cfg, args.workspace, args.agent_config_dir);
+    ovicode::runChatScreen(cfg, args.workspace, args.agent_config_dir, plugins);
 
     // Persist any settings changed during the session.
     ovicode::saveConfig(cfg, args.config_path);
