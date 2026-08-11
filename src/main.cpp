@@ -36,65 +36,39 @@ struct Args {
 
 bool stdoutIsTty() { return isatty(STDOUT_FILENO) != 0; }
 
-bool colorAllowed() {
-    if (!stdoutIsTty()) return false;
-    const char* nc = std::getenv("NO_COLOR");
-    return !(nc && *nc);
-}
-
-void printSplash(bool with_color) {
-    // Use a fixed high-contrast canvas so terminal background colors cannot
-    // hide the splash. NO_COLOR still opts out through `with_color`.
-    const char* kPrimary = with_color ? "\033[1;97;40m" : "";
-    const char* kSecondary = with_color ? "\033[37;40m" : "";
-    const char* kReset = with_color ? "\033[0m"    : "";
+void printSplash() {
     std::cout << "\n"
-              << kPrimary
-              <<"             .:--=++****++=-:.                                        .:-=**:.\n"
-              <<"         .-+#%@@@@@@@@@@@@@@@%#+-.                                   .%@@@@@@%\n"
-              <<"      .-*%@@@@@@@@@@@@@@@@@@@@@@@%+:                                -@@@@@@@@@\n"
-              <<"    .=%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#:                             -@@@@@@@@@@\n"
-              <<"   -%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+.                          -@@@@@@@@@%\n"
-              <<"  .+@@@@@@@@@@@@%#+=--:---+*%@@@@@@@@@@@%:                       .#@@@@@@@@@@\n"
-              <<"  .*@@@@@@@@@@@*-.           .-#@@@@@@@@@@@-                    .#@@@@@@@@@@\n"
-              <<"  +@@@@@@@@@@#:                .=@@@@@@@@@@@:                   *@@@@@@@@@@=\n"
-              <<"  :@@@@@@@@@@*.                   :%@@@@@@@@@%.                +@@@@@@@@@@+\n"
-              <<"  *@@@@@@@@@#.                     :@@@@@@@@@@#.              =@@@@@@@@@@*\n"
-              <<"  .@@@@@@@@@@-                       -@@@@@@@@@@=            -@@@@@@@@@@*.\n"
-              <<"  -@@@@@@@@@%.                        *@@@@@@@@@%.          -@@@@@@@@@@#.\n"
-              <<"  -@@@@@@@@@%.                        .%@@@@@@@@@+         :@@@@@@@@@@%.\n"
-              <<"  :@@@@@@@@@@:                         =@@@@@@@@@@.       :%@@@@@@@@@%:\n"
-              <<"  .#@@@@@@@@@*                         .%@@@@@@@@@+      .%@@@@@@@@@@:\n"
-              <<"   -@@@@@@@@@@=                         =@@@@@@@@@@.    .%@@@@@@@@@@-\n"
-              <<"   .*@@@@@@@@@@*.                       .%@@@@@@@@@+   .#@@@@@@@@@@-\n"
-              <<"    .#@@@@@@@@@@@*-..                    =@@@@@@@@@@: .#@@@@@@@@@@=\n"
-              <<"     .*@@@@@@@@@@@@@%#***=:              .%@@@@@@@@@#-%@@@@@@@@@@=\n"
-              <<"       =%@@@@@@@@@@@@@@@@@@*.             :@@@@@@@@@@@@@@@@@@@@@=\n"
-              <<"        .=%@@@@@@@@@@@@@@@@@=              =@@@@@@@@@@@@@@@@@@@=\n"
-              <<"          .-*%@@@@@@@@@@@@@@:               -%@@@@@@@@@@@@@@@#:\n"
-              <<"             .:=*#%@@@@@@%*:                 .=%@@@@@@@@@@@*-.\n"
-              <<"                  ..:::::.                     .:=+*###*=-.\n"
+              << "             .:--=++****++=-:.                                        .:-=**:.\n"
+              << "         .-+#%@@@@@@@@@@@@@@@%#+-.                                   .%@@@@@@%\n"
+              << "      .-*%@@@@@@@@@@@@@@@@@@@@@@@%+:                                -@@@@@@@@@\n"
+              << "    .=%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#:                             -@@@@@@@@@@\n"
+              << "   -%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+.                          -@@@@@@@@@%\n"
+              << "  .+@@@@@@@@@@@@%#+=--:---+*%@@@@@@@@@@@%:                       .#@@@@@@@@@@\n"
+              << "  .*@@@@@@@@@@@*-.           .-#@@@@@@@@@@@-                    .#@@@@@@@@@@\n"
+              << "  +@@@@@@@@@@#:                .=@@@@@@@@@@@:                   *@@@@@@@@@@=\n"
+              << "  :@@@@@@@@@@*.                   :%@@@@@@@@@%.                +@@@@@@@@@@+\n"
+              << "  *@@@@@@@@@#.                     :@@@@@@@@@@#.              =@@@@@@@@@@*\n"
+              << "  .@@@@@@@@@@-                       -@@@@@@@@@@=            -@@@@@@@@@@*.\n"
+              << "  -@@@@@@@@@%.                        *@@@@@@@@@%.          -@@@@@@@@@@#.\n"
+              << "  -@@@@@@@@@%.                        .%@@@@@@@@@+         :@@@@@@@@@@%.\n"
+              << "  :@@@@@@@@@@:                         =@@@@@@@@@@.       :%@@@@@@@@@%:\n"
+              << "  .#@@@@@@@@@*                         .%@@@@@@@@@+      .%@@@@@@@@@@:\n"
+              << "   -@@@@@@@@@@=                         =@@@@@@@@@@.    .%@@@@@@@@@@-\n"
+              << "   .*@@@@@@@@@@*.                       .%@@@@@@@@@+   .#@@@@@@@@@@-\n"
+              << "    .#@@@@@@@@@@@*-..                    =@@@@@@@@@@: .#@@@@@@@@@@=\n"
+              << "     .*@@@@@@@@@@@@@%#***=:              .%@@@@@@@@@#-%@@@@@@@@@@=\n"
+              << "       =%@@@@@@@@@@@@@@@@@@*.             :@@@@@@@@@@@@@@@@@@@@@=\n"
+              << "        .=%@@@@@@@@@@@@@@@@@=              =@@@@@@@@@@@@@@@@@@@=\n"
+              << "          .-*%@@@@@@@@@@@@@@:               -%@@@@@@@@@@@@@@@#:\n"
+              << "             .:=*#%@@@@@@%*:                 .=%@@@@@@@@@@@*-.\n"
+              << "                  ..:::::.                     .:=+*###*=-.\n"
               << "\n"
+              << "OVI-CODE\n"
+              << "Tiny code-editing TUI agent\n"
+              << "Read | Edit | Reason | Refactor | Run\n"
+              << "An Ovicorps tool\n"
               << "\n"
-              <<"                     AN OVICORPS TOOL, CREATED WITH LOVE\n"
-              <<"                     -----------------------------------\n"
-              <<"                      OVICORPS 2026, ALL RIGHTS RESERVED\n"
-              << "\n"
-              << "\n"
-              << "   ╔═══════════════════════════════════════════════════════════════════════╗\n"
-              << "   ║                                                                       ║\n"
-              << "   ║     ██████╗ ██╗   ██╗██╗       ██████╗ ██████╗ ██████╗ ███████╗       ║\n"
-              << "   ║    ██╔═══██╗██║   ██║██║      ██╔════╝██╔═══██╗██╔══██╗██╔════╝       ║\n"
-              << "   ║    ██║   ██║██║   ██║██║█████╗██║     ██║   ██║██║  ██║█████╗         ║\n"
-              << "   ║    ██║   ██║╚██╗ ██╔╝██║╚════╝██║     ██║   ██║██║  ██║██╔══╝         ║\n"
-              << "   ║    ╚██████╔╝ ╚████╔╝ ██║      ╚██████╗╚██████╔╝██████╔╝███████╗       ║\n"
-              << "   ║     ╚═════╝   ╚═══╝  ╚═╝       ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝       ║\n"
-              << "   ║                                                                       ║\n"
-               << "   ║" << kReset << kSecondary
-              << "          Read · Edit · Reason · Refactor · Run                        "
-               << kReset << kPrimary << "║\n"
-              << "   ╚═══════════════════════════════════════════════════════════════════════╝\n"
-              << kReset << std::flush;
+              << std::flush;
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 }
 
@@ -126,7 +100,28 @@ void printHelp() {
         "\n"
         "Environment overrides:\n"
         "  OPENROUTER_API_KEY         Overrides the saved OpenRouter API key.\n"
-        "  OVI_CODE_PLUGIN_DIR        Overrides the technique plugin directory.\n";
+        "  OPENAI_API_KEY             Overrides the saved OpenAI API key.\n"
+        "  ANTHROPIC_API_KEY          Overrides the saved Anthropic API key.\n"
+        "  XAI_API_KEY                Overrides the saved xAI/Grok API key.\n"
+        "  OVI_CODE_PLUGIN_DIR        Overrides the technique plugin directory.\n"
+        "\n"
+        "Keyboard shortcuts:\n"
+        "  Insert mode                Type; Enter adds a line; Esc enters Normal mode\n"
+        "  Normal movement            h/j/k/l, w/b, 0/$, gg/G\n"
+        "  Normal editing             i/a/o/O/I/A, x, dd, yy, p/P\n"
+        "  Enter                      Send the prompt from Normal mode\n"
+        "  Ctrl+W                     Toggle input/output focus\n"
+        "  Output focus               j/k scroll; g/G jump to top/bottom\n"
+        "  z                          Minimize/restore the input panel\n"
+        "  s / t / c / q              Settings / technique / clear / quit\n"
+        "\n"
+        "Settings shortcuts:\n"
+        "  j/k or arrows              Change the focused list selection\n"
+        "  Tab                        Next field; cycles a focused list\n"
+        "  Enter                      Activate the focused button\n"
+        "  i / a                      Edit the focused field\n"
+        "  Esc                        Return to Normal mode, then cancel\n"
+        "  q                          Cancel from Normal mode\n";
 }
 
 Args parseArgs(int argc, char** argv) {
@@ -231,7 +226,7 @@ int main(int argc, char** argv) {
     }
 
     if (args.command == Command::Run && args.show_splash && stdoutIsTty()) {
-        printSplash(colorAllowed());
+        printSplash();
     }
 
     std::error_code ec;
@@ -259,11 +254,8 @@ int main(int argc, char** argv) {
     ovicode::Config cfg = maybe_cfg.value_or(ovicode::Config{});
     const bool init_only = args.command == Command::Init;
 
-    if (const char* envk = std::getenv("OPENROUTER_API_KEY"); envk && *envk) {
-        cfg.openrouter_api_key = envk;
-    }
-
-    if (!maybe_cfg.has_value() || cfg.openrouter_api_key.empty() ||
+    if (!maybe_cfg.has_value() ||
+        ovicode::effectiveApiKey(cfg, cfg.provider).empty() ||
         args.reconfigure || init_only) {
         if (!ovicode::runSetupWizard(cfg, plugins)) {
             std::cerr << "Setup cancelled.\n";
@@ -280,8 +272,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (cfg.model.empty()) {
-        cfg.model = ovicode::defaultModel();
+    if (ovicode::selectedModel(cfg).empty()) {
+        ovicode::selectedModel(cfg) = ovicode::defaultModel(cfg.provider);
     }
 
     ovicode::runChatScreen(cfg, args.workspace, args.agent_config_dir, plugins);

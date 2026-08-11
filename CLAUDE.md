@@ -7,10 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cmake -S . -B build         # first configure fetches FTXUI + nlohmann/json (~30s)
 cmake --build build -j      # incremental rebuilds; binary at build/ovi-code
-./build/ovi-code             # launches TUI; first run drops into the 4-step setup wizard
+./build/ovi-code             # launches TUI; first run drops into the 5-step setup wizard
 ./build/ovi-code --setup     # force re-run the setup wizard
 ./build/ovi-code --workspace <dir> --agent-config-dir <dir>
-OPENROUTER_API_KEY=... ./build/ovi-code  # env override for the saved key
+OPENROUTER_API_KEY=... ./build/ovi-code  # provider key env overrides are supported
 ```
 
 There are **no tests** and **no linter wired up**. CMake compiles with `-Wall -Wextra -Wpedantic`; warnings are treated as the only signal.
@@ -23,7 +23,7 @@ Single-process C++20 binary. Layering, bottom-up:
 
 - **`http.{hpp,cpp}`** — minimal libcurl POST wrapper (`ovicode::http::post(url, headers, body)`). Used by the OpenRouter client. Originally used `cpr`, but cpr's libcurl build hung in a CMake try_compile on macOS; replaced with system libcurl via `find_package(CURL)`.
 - **`tools.{hpp,cpp}`** — three workspace-sandboxed tools (`read_file`, `list_files`, `edit_file`) and their JSON Schemas. `edit_file` enforces unique-occurrence matching; empty `old_str` means "create new file". `resolveInside()` is the only path-traversal guard — every tool must route through it.
-- **`providers.{hpp,cpp}`** — OpenRouter chat-completions client. The internal `ChatRequest` / `ChatResponse` / `Message` types remain wire-format agnostic; this layer translates them to OpenAI-compatible messages and tool calls for OpenRouter.
+- **`providers.{hpp,cpp}`** — provider dispatch for OpenRouter, OpenAI, Anthropic, and xAI/Grok. The internal `ChatRequest` / `ChatResponse` / `Message` types remain wire-format agnostic; this layer translates OpenAI-compatible and Anthropic-native messages and tool calls.
 - **`agent_md.{hpp,cpp}`** — loads `agent.md` / `tools.md` / `skills.md` from the workspace (or `--agent-config-dir`) and assembles the system prompt. Technique-specific prefaces are layered in here.
 - **`plugins.{hpp,cpp}` / `technique_plugin.h`** — runtime loader and versioned C ABI for user-defined C++ technique modules. Plugins are loaded from `~/.ovi-code/plugins` (or `--plugin-dir`) and drive turns through host callbacks without linking against app internals.
 - **`react.{hpp,cpp}`** — the ReAct loop. `runTurn()` is the entry point; it handles all four techniques:
@@ -44,7 +44,7 @@ The `Config` struct is mutated live by the settings screen and re-saved on quit.
 - **The chat worker thread is joined, not detached.** Holding a `std::thread worker;` member lets `runChatScreen` set `stop_requested` and `join()` before returning. The `TranscriptSink` callback returns `!stop_requested.load()` so an aborted turn unwinds cleanly through the ReAct loop. Keep this invariant — detaching will reintroduce a use-after-free risk on quit.
 - **Don't add raw `Color::*` constants in `tui.cpp`.** All chrome colors live in the `Palette` struct near the top of `tui.cpp` (dark + light variants) and are resolved per-render via `palette(cfg.theme)`. Auto-detection reads `$COLORFGBG`. New UI elements should pick a semantic slot (`pal.accent`, `pal.muted`, `pal.error`, etc.) rather than hard-coding a color — otherwise the light theme breaks. Transcript entry colors come from `kindColor(pal, kind)`.
 - **Transcript is bounded.** `runChatScreen` keeps at most ~1000 entries (`kTranscriptHardCap`); when it overflows it drops the oldest in one batch and inserts an "elided" system note. All push sites go through `pushEntryLocked` (caller holds `mu`). If you add a new code path that writes to the transcript, use the helper — direct `transcript.push_back` will silently bypass the cap.
-- **OpenRouter is the only provider.** Add curated model IDs to `knownModels()` in `config.cpp`; users can enter any other OpenRouter model ID through the custom model field.
+- **Provider accounts are persisted separately.** Add curated model IDs to the provider-specific catalog in `knownModelInfo()` in `config.cpp`; users can enter any other provider-supported model ID through the custom model field.
 - **Adding a built-in technique** means: add to `Technique` enum + `technique*` helpers + `allTechniques()` in `config.cpp`, add a preamble case in `assembleSystemPrompt()` in `agent_md.cpp`, and (if the technique alters control flow like RalphLoop/Rag) branch on it in `runTurn()` in `react.cpp`. User-defined techniques should instead implement `technique_plugin.h`; the setup wizard and Settings discover them at runtime.
 - **`builtinTools()` is the only tool registry.** Anything new needs a `ToolDefinition` there plus a handler branch in `executeTool()`. OpenRouter picks it up automatically because requests serialize from the same list.
 

@@ -1,9 +1,11 @@
 # OVI-CODE
 
 OVI-CODE is a terminal-based coding agent written in C++20. It connects to
-models through [OpenRouter](https://openrouter.ai/), inspects a selected
-workspace, and can read, create, and edit files while showing every tool call
-in a full-screen TUI.
+OpenRouter, OpenAI, Anthropic, or xAI/Grok, inspects a selected workspace, and
+can read, create, and edit files while showing every tool call in a full-screen
+TUI.
+
+**Documentation:** [ovicorps.github.io/ovi-code](https://ovicorps.github.io/ovi-code/)
 
 ## Contents
 
@@ -24,8 +26,9 @@ in a full-screen TUI.
 
 - Full-screen, keyboard-driven terminal interface built with FTXUI.
 - Vim-style multiline prompt and configuration-file editors.
-- OpenRouter model picker with capability-aware reasoning effort and support
-  for custom model IDs.
+- Per-provider accounts for OpenRouter, OpenAI, Anthropic, and xAI/Grok.
+- Provider-specific model pickers with capability-aware reasoning effort and
+  support for custom model IDs.
 - Visible model responses, tool calls, tool results, and file diffs.
 - Workspace-sandboxed file tools.
 - Standard ReAct, Chain of Thought, Ralph Loop, and RAG techniques.
@@ -40,9 +43,8 @@ To use OVI-CODE, you need:
 
 - macOS or another environment capable of building the C++ application.
 - A terminal with UTF-8 and color support.
-- An [OpenRouter API key](https://openrouter.ai/keys) beginning with
-  `sk-or-v1-`.
-- An OpenRouter account with sufficient credits for the selected model.
+- An API key and sufficient credits for at least one supported provider:
+  OpenRouter, OpenAI, Anthropic, or xAI.
 
 Building from source additionally requires CMake 3.20+, a C++20 compiler,
 system libcurl, Git, and an internet connection during the first configure.
@@ -82,20 +84,24 @@ For a source build, run:
 ./build/ovi-code
 ```
 
-The first launch opens a four-step setup wizard:
+The first launch opens a five-step setup wizard:
 
-1. Enter your OpenRouter API key.
-2. Select an OpenRouter model or enter a custom model ID.
-3. Select a reasoning effort supported by that model.
-4. Select the default agentic technique.
+1. Select OpenRouter, OpenAI, Anthropic, or xAI/Grok.
+2. Enter that provider's API key.
+3. Select a curated model or enter a custom provider model ID.
+4. Select a reasoning effort supported by that model.
+5. Select the default agentic technique.
 
 The configuration is saved to `~/.ovi-code/config.json` with permissions set
 to `0600`.
 
-You can also provide an API key through the environment:
+You can also provide provider API keys through the environment:
 
 ```bash
 export OPENROUTER_API_KEY="sk-or-v1-..."
+export OPENAI_API_KEY="sk-..."
+export ANTHROPIC_API_KEY="sk-ant-..."
+export XAI_API_KEY="xai-..."
 ovi-code
 ```
 
@@ -225,7 +231,7 @@ the next agent turn and saved when the application exits.
 
 Settings include:
 
-- OpenRouter model and API key.
+- Provider account, model, and API key. Each provider retains its own values.
 - Reasoning effort filtered to the selected model's capabilities.
 - Agentic technique.
 - Theme.
@@ -239,10 +245,9 @@ Settings uses the same modal navigation style:
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` / `h` / `l` | Navigate fields and choices |
-| Arrow keys | Navigate fields and choices |
-| `Tab` | Move between controls |
-| `Space` / `Enter` | Select or activate the focused control |
+| `j` / `k` or arrows | Change the focused list selection |
+| `Tab` | Move between controls; cycles a focused list |
+| `Enter` | Activate the focused button |
 | `i` / `a` | Edit the focused text field |
 | `Esc` | Return to Normal mode or close Settings |
 | `q` | Close Settings from Normal mode |
@@ -397,8 +402,8 @@ The current ABI version and exact declarations are in
 
 ## Curated Models And Effort
 
-The curated picker includes the latest Fable, Opus 5, and GPT-5.6 variants
-reported by OpenRouter:
+Each provider has its own curated model list. The OpenRouter picker includes
+the latest Fable, Opus 5, and GPT-5.6 variants reported by OpenRouter:
 
 | Family | Model IDs |
 | --- | --- |
@@ -408,9 +413,10 @@ reported by OpenRouter:
 | GPT-5.6 Terra | `openai/gpt-5.6-terra`, `openai/gpt-5.6-terra-pro` |
 | GPT-5.6 Luna | `openai/gpt-5.6-luna`, `openai/gpt-5.6-luna-pro` |
 
-Reasoning effort is sent through OpenRouter's normalized
-`reasoning.effort` parameter. The available choices change with the selected
-model:
+Direct OpenAI, Anthropic, and xAI accounts use provider-native model IDs, while
+OpenRouter IDs retain their vendor prefix. Reasoning effort is translated to
+each provider's native API parameter. The available choices change with the
+selected model:
 
 - Fable and Opus 5 expose Max, Extra high, High, Medium, and Low.
 - GPT-5.6 variants expose Max, Extra high, High, Medium, Low, and None.
@@ -479,8 +485,10 @@ ovi-code [command] [options]
 | Variable | Description |
 | --- | --- |
 | `OPENROUTER_API_KEY` | Override the saved OpenRouter API key |
+| `OPENAI_API_KEY` | Override the saved OpenAI API key |
+| `ANTHROPIC_API_KEY` | Override the saved Anthropic API key |
+| `XAI_API_KEY` | Override the saved xAI/Grok API key |
 | `OVI_CODE_PLUGIN_DIR` | Override the runtime technique plugin directory |
-| `NO_COLOR` | Disable colors in the startup splash |
 | `COLORFGBG` | Help automatic theme detection determine terminal brightness |
 
 ## Tools And Safety
@@ -503,23 +511,25 @@ unrelated sensitive files.
 ## Configuration And Privacy
 
 Application settings are stored in `~/.ovi-code/config.json`. The file includes
-the OpenRouter API key and is restricted to the current user with mode `0600`.
-Use `--config` to choose another location.
+the saved key and model for each provider account and is restricted to the
+current user with mode `0600`. Environment-provided keys are not persisted. Use
+`--config` to choose another location.
 
 Chat history is not persisted to disk. The `c` command clears only the visible
 transcript; it does not remove the current conversation context sent to the
 model. Restart the application to begin with empty context.
 
 Requests, assembled project instructions, and file contents returned by tools
-may be sent to OpenRouter and the selected model provider. Review OpenRouter's
-privacy and retention policies before using OVI-CODE with confidential code.
+are sent to the selected provider. OpenRouter requests may also be handled by
+the model provider it routes to. Review the applicable privacy and retention
+policies before using OVI-CODE with confidential code.
 
 ## Troubleshooting
 
-### OpenRouter authentication fails
+### Provider authentication fails
 
-Use an OpenRouter key beginning with `sk-or-v1-`, not a provider-native OpenAI,
-Anthropic, or Google key. Update it in Settings or run:
+Confirm Settings has the key for the selected provider, or set its environment
+variable. OpenRouter keys must begin with `sk-or-v1-`. To reconfigure, run:
 
 ```bash
 ovi-code --setup
@@ -556,9 +566,9 @@ with `--agent-config-dir`. Changes are loaded at the start of the next turn.
 
 ### A model request fails
 
-Confirm the model ID exists on OpenRouter, the account has credits, and the
-network can reach `https://openrouter.ai`. Try another model from Settings if
-the selected model does not support the requested operation.
+Confirm the model ID exists for the selected provider, the account has credits,
+and the provider API is reachable. Try another model from Settings if the
+selected model does not support the requested operation.
 
 ## Uninstall
 
@@ -584,9 +594,29 @@ cmake --build build -j
 cmake --install build --prefix ~/.local
 ```
 
+The Makefile provides equivalent development commands:
+
+```bash
+make build
+make run
+make run ARGS="--workspace /path/to/project"
+```
+
 CMake downloads FTXUI and nlohmann/json during the first configure and links
 against system libcurl. The installed executable is placed in the selected
 prefix's `bin` directory.
+
+Build, preview, or deploy the documentation with:
+
+```bash
+make docs-install
+make docs
+make docs-serve
+make docs-deploy DOCS_REF=main
+```
+
+`docs-deploy` requires an authenticated GitHub CLI and dispatches
+`.github/workflows/docs.yml`, which publishes the selected ref to GitHub Pages.
 
 ## Homebrew Maintainers
 

@@ -7,6 +7,13 @@
 
 namespace ovicode {
 
+enum class Provider {
+    OpenRouter,
+    OpenAI,
+    Anthropic,
+    XAI,
+};
+
 enum class Technique {
     Standard,
     ChainOfThought,
@@ -41,6 +48,20 @@ struct ModelInfo {
     bool supports_temperature = true;
 };
 
+struct ProviderInfo {
+    Provider provider;
+    std::string id;
+    std::string label;
+    std::string environment_variable;
+    std::string key_placeholder;
+};
+
+const std::vector<ProviderInfo>& knownProviders();
+const ProviderInfo& providerInfo(Provider provider);
+std::string providerLabel(Provider provider);
+Provider providerFromString(const std::string& value);
+std::string providerToString(Provider provider);
+
 std::string techniqueLabel(Technique t);
 std::string techniqueDescription(Technique t);
 Technique techniqueFromString(const std::string& s);
@@ -56,17 +77,27 @@ const std::vector<Theme>& allThemes();
 std::string reasoningEffortLabel(ReasoningEffort effort);
 std::string reasoningEffortToString(ReasoningEffort effort);
 ReasoningEffort reasoningEffortFromString(const std::string& value);
-const std::vector<ModelInfo>& knownModelInfo();
-const ModelInfo* findModelInfo(const std::string& model);
-std::vector<ReasoningEffort> reasoningEffortOptions(const std::string& model);
-ReasoningEffort effectiveReasoningEffort(const std::string& model,
+const std::vector<ModelInfo>& knownModelInfo(Provider provider);
+const ModelInfo* findModelInfo(Provider provider, const std::string& model);
+std::vector<ReasoningEffort> reasoningEffortOptions(Provider provider,
+                                                     const std::string& model);
+ReasoningEffort effectiveReasoningEffort(Provider provider,
+                                         const std::string& model,
                                          ReasoningEffort configured);
-const std::vector<std::string>& knownModels();
-const std::string& defaultModel();
+const std::vector<std::string>& knownModels(Provider provider);
+const std::string& defaultModel(Provider provider);
+
+struct ProviderAccount {
+    std::string model;
+    std::string api_key;
+};
 
 struct Config {
-    std::string model = defaultModel();
-    std::string openrouter_api_key;
+    Provider provider = Provider::OpenRouter;
+    ProviderAccount openrouter{defaultModel(Provider::OpenRouter), {}};
+    ProviderAccount openai{defaultModel(Provider::OpenAI), {}};
+    ProviderAccount anthropic{defaultModel(Provider::Anthropic), {}};
+    ProviderAccount xai{defaultModel(Provider::XAI), {}};
     Technique technique = Technique::Standard;
     std::string technique_id = "standard";
     Theme theme = Theme::Plain;
@@ -77,6 +108,13 @@ struct Config {
     int max_tokens = 4096;
     double temperature = 0.2;
 };
+
+ProviderAccount& providerAccount(Config& config, Provider provider);
+const ProviderAccount& providerAccount(const Config& config,
+                                       Provider provider);
+std::string& selectedModel(Config& config);
+const std::string& selectedModel(const Config& config);
+std::string effectiveApiKey(const Config& config, Provider provider);
 
 std::filesystem::path defaultConfigDir();
 std::filesystem::path defaultConfigPath();

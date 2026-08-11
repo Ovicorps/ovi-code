@@ -15,7 +15,8 @@ struct Message {
     Role role;
     std::string text;
     std::vector<ToolCall> tool_calls;  // populated when role == Assistant
-    nlohmann::json reasoning_details;  // replayed for reasoning tool calls
+    // Opaque provider-native assistant state replayed during tool continuations.
+    nlohmann::json reasoning_details;
     std::string tool_call_id;          // populated when role == Tool
     std::string tool_name;             // populated when role == Tool
     bool is_error = false;             // populated when role == Tool

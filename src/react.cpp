@@ -235,8 +235,9 @@ bool runReactLoop(const AgentContext& ctx, std::vector<Message>& messages,
         req.tools = builtinTools();
         auto resp = chat(ctx.config, req);
         if (!resp.error.empty()) {
-            emit(sink, TranscriptEntry::Kind::Error, "OpenRouter error",
-                 resp.error);
+            emit(sink, TranscriptEntry::Kind::Error,
+                  providerLabel(ctx.config.provider) + " error",
+                  resp.error);
             return false;
         }
 

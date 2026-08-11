@@ -286,10 +286,11 @@ int indexOfModel(const std::vector<std::string>& models,
     return -1;
 }
 
-std::string reasoningEffortChoiceLabel(const std::string& model,
-                                       ReasoningEffort effort) {
+std::string reasoningEffortChoiceLabel(Provider provider,
+                                        const std::string& model,
+                                        ReasoningEffort effort) {
     if (effort != ReasoningEffort::Auto) return reasoningEffortLabel(effort);
-    const ModelInfo* info = findModelInfo(model);
+    const ModelInfo* info = findModelInfo(provider, model);
     if (info && info->auto_effort != ReasoningEffort::Auto) {
         return "Auto — model default: " +
                reasoningEffortLabel(info->auto_effort);
@@ -306,14 +307,14 @@ int indexOfReasoningEffort(const std::vector<ReasoningEffort>& options,
 }
 
 void refreshReasoningEffortChoices(
-    const std::string& model, ReasoningEffort selected,
+    Provider provider, const std::string& model, ReasoningEffort selected,
     std::vector<ReasoningEffort>& options, std::vector<std::string>& choices,
     int& selected_index) {
-    options = reasoningEffortOptions(model);
+    options = reasoningEffortOptions(provider, model);
     choices.clear();
     choices.reserve(options.size());
     for (ReasoningEffort effort : options) {
-        choices.push_back(reasoningEffortChoiceLabel(model, effort));
+        choices.push_back(reasoningEffortChoiceLabel(provider, model, effort));
     }
     selected_index = indexOfReasoningEffort(options, selected);
 }
@@ -387,10 +388,8 @@ Component vimModalLayer(Component child, ChatMode& mode,
                 child->OnEvent(Event::ArrowRight);
                 return true;
             }
-            // Space commits the focused Radiobox selection (FTXUI Radiobox
-            // selects on Space/Enter). Let it fall through to the child so the
-            // settings selectors behave like radio buttons. Enter already
-            // reaches components natively (it isn't a "character" event).
+            // Let Space reach any focused component that handles it. Enter
+            // already reaches components natively (it isn't a character event).
             if (e == Event::Character(" ")) return false;
             // Swallow any other raw character so focused Inputs stay inert in
             // NORMAL; arrows / Tab / Enter still reach the components natively.
@@ -419,7 +418,17 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
     clearTerminal();
     auto screen = ScreenInteractive::TerminalOutput();
 
-    int step = 0;  // 0=OpenRouter key, 1=model, 2=effort, 3=technique
+    int step = 0;  // provider, key, model, effort, technique
+    Config staged = cfg;
+    const auto& providers = knownProviders();
+    std::vector<std::string> provider_choices;
+    int provider_idx = 0;
+    for (size_t i = 0; i < providers.size(); ++i) {
+        provider_choices.push_back(providers[i].label);
+        if (providers[i].provider == staged.provider) {
+            provider_idx = static_cast<int>(i);
+        }
+    }
     auto technique_ids = techniqueIds(plugins);
     const std::string configured_technique =
         cfg.technique_id.empty() ? techniqueToString(cfg.technique)
@@ -430,9 +439,11 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
         technique_ids.push_back(configured_technique);
         technique_idx = static_cast<int>(technique_ids.size()) - 1;
     }
-    std::string api_key = cfg.openrouter_api_key;
-    std::string model = cfg.model.empty() ? defaultModel() : cfg.model;
-    ReasoningEffort effort = cfg.reasoning_effort;
+    Provider loaded_provider = staged.provider;
+    std::string api_key = providerAccount(staged, loaded_provider).api_key;
+    std::string model = providerAccount(staged, loaded_provider).model;
+    if (model.empty()) model = defaultModel(loaded_provider);
+    ReasoningEffort effort = staged.reasoning_effort;
     bool aborted = false;
     bool finished = false;
     // Start in NORMAL so j/k drive the menus immediately; i/a edits inputs.
@@ -445,9 +456,11 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
 
     InputOption key_opts = paletteInputOption(cfg);
     key_opts.password = true;
-    auto key_input = Input(&api_key, "sk-or-v1-...", key_opts);
+    auto key_input = Input(&api_key, "API key", key_opts);
 
-    std::vector<std::string> model_choices = knownModels();
+    auto provider_menu =
+        Menu(&provider_choices, &provider_idx, highContrastMenuOption());
+    std::vector<std::string> model_choices = knownModels(loaded_provider);
     model_choices.push_back("(custom — type below)");
     int model_idx = indexOfModel(model_choices, model);
     if (model_idx < 0) model_idx = static_cast<int>(model_choices.size()) - 1;
@@ -458,7 +471,7 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
     std::vector<ReasoningEffort> effort_options;
     std::vector<std::string> effort_choices;
     int effort_idx = 0;
-    refreshReasoningEffortChoices(model, effort, effort_options,
+    refreshReasoningEffortChoices(loaded_provider, model, effort, effort_options,
                                   effort_choices, effort_idx);
     auto effort_menu =
         Menu(&effort_choices, &effort_idx, highContrastMenuOption());
@@ -466,21 +479,61 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
     auto technique_menu =
         Menu(&technique_choices, &technique_idx, highContrastMenuOption());
 
+    auto save_loaded_account = [&] {
+        auto& account = providerAccount(staged, loaded_provider);
+        account.api_key = api_key;
+        if (model_idx >= 0 &&
+            model_idx < static_cast<int>(model_choices.size()) - 1) {
+            account.model = model_choices[model_idx];
+        } else if (!model.empty()) {
+            account.model = model;
+        } else {
+            account.model = defaultModel(loaded_provider);
+        }
+        model = account.model;
+    };
+    auto load_provider = [&](Provider provider) {
+        loaded_provider = provider;
+        staged.provider = provider;
+        const auto& account = providerAccount(staged, provider);
+        api_key = account.api_key;
+        model = account.model.empty() ? defaultModel(provider) : account.model;
+        model_choices = knownModels(provider);
+        model_choices.push_back("(custom — type below)");
+        model_idx = indexOfModel(model_choices, model);
+        if (model_idx < 0) {
+            model_idx = static_cast<int>(model_choices.size()) - 1;
+        }
+        refreshReasoningEffortChoices(provider, model, effort, effort_options,
+                                      effort_choices, effort_idx);
+    };
+
     auto next_button = Button("Next  ▶", [&] {
         if (step == 0) {
+            save_loaded_account();
+            if (provider_idx >= 0 &&
+                provider_idx < static_cast<int>(providers.size())) {
+                load_provider(providers[provider_idx].provider);
+            }
             ++step;
         } else if (step == 1) {
+            providerAccount(staged, loaded_provider).api_key = api_key;
+            ++step;
+        } else if (step == 2) {
             if (model_idx >= 0 &&
                 model_idx < static_cast<int>(model_choices.size()) - 1) {
                 model = model_choices[model_idx];
             }
-            refreshReasoningEffortChoices(model, effort, effort_options,
+            save_loaded_account();
+            refreshReasoningEffortChoices(loaded_provider, model, effort,
+                                          effort_options,
                                           effort_choices, effort_idx);
             ++step;
-        } else if (step == 2) {
-            effort = effort_options[effort_idx];
-            ++step;
         } else if (step == 3) {
+            effort = effort_options[effort_idx];
+            staged.reasoning_effort = effort;
+            ++step;
+        } else if (step == 4) {
             finished = true;
             screen.ExitLoopClosure()();
         }
@@ -497,6 +550,7 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
 
     auto layout = Container::Tab(
         {
+            provider_menu,
             key_input,
             Container::Vertical({model_menu, model_input}),
             effort_menu,
@@ -514,29 +568,42 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
         Element body;
         if (step == 0) {
             body = vbox({
-                text("1. Configure OpenRouter") | bold | color(pal.accent),
+                text("1. Choose an LLM provider") | bold | color(pal.accent),
                 separator(),
-                hbox({text("API key: "), blockCursorInput(key_input)}),
+                provider_menu->Render() | frame | size(HEIGHT, LESS_THAN, 8),
                 text(""),
                 paragraph(
-                    "Your key is saved to ~/.ovi-code/config.json "
-                    "with 0600 permissions. Leave blank to skip if you set "
-                    "OPENROUTER_API_KEY in the environment.") |
+                    "Each provider keeps its own API key and model selection. "
+                    "You can switch accounts later in Settings.") |
                     color(pal.muted),
             });
         } else if (step == 1) {
             body = vbox({
-                text("2. Choose an OpenRouter model") | bold |
+                text("2. Configure " + providerLabel(loaded_provider)) | bold |
                     color(pal.accent),
+                separator(),
+                hbox({text("API key: "), blockCursorInput(key_input)}),
+                text(""),
+                paragraph(
+                    "Saved to ~/.ovi-code/config.json with 0600 permissions. "
+                    "Leave blank when " +
+                    providerInfo(loaded_provider).environment_variable +
+                    " is set in the environment.") |
+                    color(pal.muted),
+            });
+        } else if (step == 2) {
+            body = vbox({
+                text("3. Choose a " + providerLabel(loaded_provider) + " model") |
+                    bold | color(pal.accent),
                 separator(),
                 model_menu->Render() | frame |
                     size(HEIGHT, LESS_THAN, 10),
                 text(""),
                 hbox({text("Custom model: "), blockCursorInput(model_input)}),
             });
-        } else if (step == 2) {
+        } else if (step == 3) {
             body = vbox({
-                text("3. Choose reasoning effort") | bold |
+                text("4. Choose reasoning effort") | bold |
                     color(pal.accent),
                 separator(),
                 effort_menu->Render() | frame |
@@ -544,12 +611,12 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
                 text(""),
                 paragraph(
                     "Only effort levels supported by the selected model are "
-                    "shown. Auto follows that model's OpenRouter default.") |
+                    "shown. Auto lets the provider manage reasoning.") |
                     color(pal.muted),
             });
         } else {
             body = vbox({
-                text("4. Choose default agentic technique") | bold |
+                text("5. Choose default agentic technique") | bold |
                     color(pal.accent),
                 separator(),
                 technique_menu->Render() | frame |
@@ -580,13 +647,13 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
                                                    : pal.normal_mode) |
                     bold,
                 text("  "),
-                text("step " + std::to_string(step + 1) + "/4") |
+                text("step " + std::to_string(step + 1) + "/5") |
                     color(pal.muted),
             }),
             text(mode == ChatMode::Insert
-                     ? "INSERT · type · Esc → NORMAL"
-                     : "NORMAL · j k move · Tab field · i a edit · "
-                       "Enter select · q cancel") |
+                      ? "INSERT · type · Esc → NORMAL"
+                      : "NORMAL · j/k choose · Tab field · i/a edit · "
+                        "Enter button · q cancel") |
                 color(pal.muted) | center,
         }) | color(pal.foreground);
         return onPaletteCanvas(
@@ -602,17 +669,10 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
     if (aborted) return false;
     if (!finished) return false;
 
-    if (model_idx >= 0 &&
-        model_idx < static_cast<int>(model_choices.size()) - 1) {
-        cfg.model = model_choices[model_idx];
-    } else if (!model.empty()) {
-        cfg.model = model;
-    } else {
-        cfg.model = defaultModel();
-    }
-    cfg.openrouter_api_key = api_key;
-    cfg.reasoning_effort = effort;
-    selectTechnique(cfg, technique_ids[technique_idx]);
+    save_loaded_account();
+    staged.reasoning_effort = effort;
+    selectTechnique(staged, technique_ids[technique_idx]);
+    cfg = std::move(staged);
     return true;
 }
 
@@ -624,15 +684,22 @@ namespace {
 // bound into the Radiobox/Input components stay valid for the whole lifetime of
 // the panel (which now lives as long as the chat screen, not a single Loop).
 struct SettingsState {
+    int page_idx = 0;
+    int provider_idx = 0;
     int technique_idx = 0;
     int theme_idx = 0;
     int model_idx = 0;
     int effort_idx = 0;
+    Provider loaded_provider = Provider::OpenRouter;
+    Provider effort_provider = Provider::OpenRouter;
+    Config staged;
     std::string api_key, model, max_iters_s, ralph_s, plugin_iters_s, temp_s;
     std::string effort_model;
     std::vector<ReasoningEffort> effort_options;
-    std::vector<std::string> technique_ids, technique_choices, theme_choices,
-        model_choices, effort_choices;
+    std::vector<std::string> page_choices{
+        "Model", "Agent", "Appearance", "Shortcuts"};
+    std::vector<std::string> provider_choices, technique_ids,
+        technique_choices, theme_choices, model_choices, effort_choices;
 };
 
 // The settings panel as an embeddable modal: `component` is layered over the
@@ -657,23 +724,44 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
     auto st = std::make_shared<SettingsState>();
     st->technique_ids = techniqueIds(plugins);
     st->technique_choices = techniqueLabels(plugins);
+    for (const auto& info : knownProviders()) {
+        st->provider_choices.push_back(info.label);
+    }
     for (auto t : allThemes())
         st->theme_choices.push_back(themeLabel(t) + " — " +
                                     themeDescription(t));
 
-    // Radiobox (vs Menu) gives single-select radio behaviour: navigating the
-    // list moves focus but does not change the saved value — only Space/Enter
-    // commits the focused entry, and the ◉/◯ glyph marks the active choice.
-    auto technique_menu = Radiobox(&st->technique_choices, &st->technique_idx);
-    auto theme_menu = Radiobox(&st->theme_choices, &st->theme_idx);
-    auto model_menu = Radiobox(&st->model_choices, &st->model_idx);
-    auto effort_menu = Radiobox(&st->effort_choices, &st->effort_idx);
+    // Menus track externally synchronized indices, which matters when changing
+    // providers replaces the model and effort lists in place.
+    auto provider_menu = Menu(&st->provider_choices, &st->provider_idx);
+    auto technique_menu = Menu(&st->technique_choices, &st->technique_idx);
+    auto theme_menu = Menu(&st->theme_choices, &st->theme_idx);
+    auto model_menu = Menu(&st->model_choices, &st->model_idx);
+    auto effort_menu = Menu(&st->effort_choices, &st->effort_idx);
     auto model_input =
         Input(&st->model, "model id", paletteInputOption(cfg));
+    auto custom_model_input = Maybe(model_input, [st] {
+        return st->model_idx ==
+               static_cast<int>(st->model_choices.size()) - 1;
+    });
+
+    MenuOption page_option = MenuOption::Horizontal();
+    page_option.entries_option.transform = [&cfg](const EntryState& state) {
+        const Palette& pal = palette(cfg.theme);
+        Element entry = text(" " + state.label + " ");
+        if (state.active) {
+            entry |= color(pal.background) | bgcolor(pal.accent) | bold;
+        } else {
+            entry |= color(pal.muted);
+            if (state.focused) entry |= inverted;
+        }
+        return entry;
+    };
+    auto page_menu = Menu(&st->page_choices, &st->page_idx, page_option);
 
     InputOption pw = paletteInputOption(cfg);
     pw.password = true;
-    auto key_input = Input(&st->api_key, "sk-or-v1-...", pw);
+    auto key_input = Input(&st->api_key, "API key", pw);
     auto iters_input =
         Input(&st->max_iters_s, "max tool iters", paletteInputOption(cfg));
     auto ralph_input = Input(&st->ralph_s, "ralph iterations",
@@ -690,16 +778,60 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         }
         return st->model;
     };
-    auto refresh_effort = [st, current_model](ReasoningEffort selected) {
+    auto current_provider = [st] {
+        const auto& providers = knownProviders();
+        if (st->provider_idx >= 0 &&
+            st->provider_idx < static_cast<int>(providers.size())) {
+            return providers[st->provider_idx].provider;
+        }
+        return st->loaded_provider;
+    };
+    auto refresh_effort = [st, current_model,
+                           current_provider](ReasoningEffort selected) {
+        st->effort_provider = current_provider();
         st->effort_model = current_model();
         refreshReasoningEffortChoices(
-            st->effort_model, selected, st->effort_options,
+            st->effort_provider, st->effort_model, selected, st->effort_options,
             st->effort_choices, st->effort_idx);
+    };
+    auto save_account_fields = [st, current_model] {
+        auto& account = providerAccount(st->staged, st->loaded_provider);
+        account.api_key = st->api_key;
+        account.model = current_model();
+        if (account.model.empty()) {
+            account.model = defaultModel(st->loaded_provider);
+        }
+    };
+    auto load_provider_fields = [st, refresh_effort](
+                                    Provider provider,
+                                    ReasoningEffort selected_effort) {
+        st->loaded_provider = provider;
+        st->staged.provider = provider;
+        const auto& account = providerAccount(st->staged, provider);
+        st->api_key = account.api_key;
+        st->model = account.model.empty() ? defaultModel(provider) : account.model;
+        st->model_choices = knownModels(provider);
+        st->model_choices.push_back("(custom model ID)");
+        st->model_idx = indexOfModel(st->model_choices, st->model);
+        if (st->model_idx < 0) {
+            st->model_idx = static_cast<int>(st->model_choices.size()) - 1;
+        }
+        refresh_effort(selected_effort);
     };
 
     // Re-read every field from the live config. Called once now to initialise
     // and again by the caller each time the panel is reopened.
-    auto sync = [st, &cfg, &plugins, refresh_effort] {
+    auto sync = [st, &cfg, &plugins, load_provider_fields] {
+        st->page_idx = 0;
+        st->staged = cfg;
+        st->provider_idx = 0;
+        const auto& providers = knownProviders();
+        for (size_t i = 0; i < providers.size(); ++i) {
+            if (providers[i].provider == cfg.provider) {
+                st->provider_idx = static_cast<int>(i);
+                break;
+            }
+        }
         st->technique_ids = techniqueIds(plugins);
         st->technique_choices = techniqueLabels(plugins);
         const std::string technique_id =
@@ -717,88 +849,94 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         const auto& themes = allThemes();
         for (size_t i = 0; i < themes.size(); ++i)
             if (themes[i] == cfg.theme) { st->theme_idx = (int)i; break; }
-        st->api_key = cfg.openrouter_api_key;
-        st->model = cfg.model;
         st->max_iters_s = std::to_string(cfg.max_tool_iterations);
         st->ralph_s = std::to_string(cfg.ralph_iterations);
         st->plugin_iters_s = std::to_string(cfg.plugin_iterations);
         st->temp_s = std::to_string(cfg.temperature);
-        st->model_choices = knownModels();
-        st->model_choices.push_back("(custom — type below)");
-        st->model_idx = indexOfModel(st->model_choices, cfg.model);
-        if (st->model_idx < 0) {
-            st->model_idx = static_cast<int>(st->model_choices.size()) - 1;
-        }
-        refresh_effort(cfg.reasoning_effort);
+        load_provider_fields(cfg.provider, cfg.reasoning_effort);
     };
     sync();
 
-    auto save = [st, &cfg, close] {
-        if (st->model_idx >= 0 &&
-            st->model_idx < static_cast<int>(st->model_choices.size()) - 1) {
-            cfg.model = st->model_choices[st->model_idx];
-        } else if (!st->model.empty()) {
-            cfg.model = st->model;
-        }
-        cfg.openrouter_api_key = st->api_key;
+    auto save = [st, &cfg, close, current_provider, save_account_fields] {
+        save_account_fields();
+        st->staged.provider = current_provider();
         if (st->effort_idx >= 0 &&
             st->effort_idx < static_cast<int>(st->effort_options.size())) {
-            cfg.reasoning_effort = st->effort_options[st->effort_idx];
+            st->staged.reasoning_effort = st->effort_options[st->effort_idx];
         }
-        selectTechnique(cfg, st->technique_ids[st->technique_idx]);
+        selectTechnique(st->staged, st->technique_ids[st->technique_idx]);
         if (st->theme_idx >= 0 &&
             st->theme_idx < static_cast<int>(allThemes().size())) {
-            cfg.theme = allThemes()[st->theme_idx];
+            st->staged.theme = allThemes()[st->theme_idx];
         }
         try {
-            cfg.max_tool_iterations = std::max(1, std::stoi(st->max_iters_s));
+            st->staged.max_tool_iterations =
+                std::max(1, std::stoi(st->max_iters_s));
         } catch (...) {
         }
         try {
-            cfg.ralph_iterations = std::max(1, std::stoi(st->ralph_s));
+            st->staged.ralph_iterations =
+                std::max(1, std::stoi(st->ralph_s));
         } catch (...) {
         }
         try {
-            cfg.plugin_iterations =
+            st->staged.plugin_iterations =
                 std::max(1, std::stoi(st->plugin_iters_s));
         } catch (...) {
         }
         try {
-            cfg.temperature = std::stod(st->temp_s);
+            st->staged.temperature = std::stod(st->temp_s);
         } catch (...) {
         }
+        cfg = st->staged;
         close(true);
     };
 
-    auto save_button = Button("Save", save);
+    auto save_button = Button("Save changes", save);
     auto cancel_button = Button("Cancel", [close] { close(false); });
     auto tools_button = Button("Edit tools.md", std::move(edit_tools));
     auto skills_button = Button("Edit skills.md", std::move(edit_skills));
 
-    auto layout = Container::Vertical({
+    auto model_page = Container::Vertical({
+        provider_menu,
         model_menu,
-        model_input,
+        custom_model_input,
         effort_menu,
         key_input,
+    });
+    auto agent_page = Container::Vertical({
         technique_menu,
-        theme_menu,
         iters_input,
         ralph_input,
         plugin_iters_input,
         temp_input,
         tools_button,
         skills_button,
+    });
+    auto appearance_page = Container::Vertical({theme_menu});
+    auto shortcuts_page = Renderer([] { return text(""); });
+    auto pages = Container::Tab(
+        {model_page, agent_page, appearance_page, shortcuts_page},
+        &st->page_idx);
+    auto layout = Container::Vertical({
+        page_menu,
+        pages,
         Container::Horizontal({save_button, cancel_button}),
     });
 
     auto renderer = Renderer(layout, [=, &cfg, &screen, &mode] {
         const Palette& pal = palette(cfg.theme);
-        if (current_model() != st->effort_model) {
-            ReasoningEffort selected = ReasoningEffort::Auto;
-            if (st->effort_idx >= 0 &&
-                st->effort_idx < static_cast<int>(st->effort_options.size())) {
-                selected = st->effort_options[st->effort_idx];
-            }
+        ReasoningEffort selected = ReasoningEffort::Auto;
+        if (st->effort_idx >= 0 &&
+            st->effort_idx < static_cast<int>(st->effort_options.size())) {
+            selected = st->effort_options[st->effort_idx];
+        }
+        const Provider provider = current_provider();
+        if (provider != st->loaded_provider) {
+            save_account_fields();
+            load_provider_fields(provider, selected);
+        } else if (provider != st->effort_provider ||
+                   current_model() != st->effort_model) {
             refresh_effort(selected);
         }
         // Default the hardware cursor to Hidden every frame; blockCursorInput
@@ -808,49 +946,127 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         // to a Menu/Radiobox/Button, which renders no cursor node of its own.
         screen.SetCursor(Screen::Cursor{0, 0, Screen::Cursor::Hidden});
 
-        // The form is taller than a typical 80x24 terminal. Keep the banner,
-        // action buttons and footer pinned (always visible / reachable) and let
-        // the two-column body scroll inside a yframe — FTXUI auto-scrolls a
-        // frame to keep the focused field on screen as you Tab through. Without
-        // this the Modal's `clear_under | center` clips an oversized panel top
-        // and bottom, hiding Save/Cancel entirely on short terminals.
-        Element form =
-            hbox({
-                vbox({
-                    text("OpenRouter model") | bold | color(pal.accent),
-                    model_menu->Render() | frame | size(HEIGHT, LESS_THAN, 10),
-                    hbox({text("Custom: "), blockCursorInput(model_input)}),
-                    text(""),
-                    text("Reasoning effort") | bold | color(pal.accent),
-                    effort_menu->Render() | frame |
-                        size(HEIGHT, LESS_THAN, 8),
-                }) | flex,
-                separator(),
-                vbox({
-                    text("OpenRouter API key") | bold | color(pal.accent),
-                    blockCursorInput(key_input),
-                    text(""),
-                    text("Technique") | bold | color(pal.accent),
-                    technique_menu->Render() | frame |
-                        size(HEIGHT, LESS_THAN, 6),
-                    text(""),
-                    text("Theme") | bold | color(pal.accent),
-                    theme_menu->Render() | frame | size(HEIGHT, LESS_THAN, 5),
-                    text(""),
-                    hbox({text("Max tool iters: "),
-                          blockCursorInput(iters_input)}),
-                    hbox({text("Ralph iters:    "),
-                          blockCursorInput(ralph_input)}),
-                    hbox({text("Plugin passes:  "),
-                          blockCursorInput(plugin_iters_input)}),
-                    hbox({text("Temperature:    "),
-                          blockCursorInput(temp_input)}),
-                    text(""),
-                    text("Agent configuration") | bold | color(pal.accent),
-                    hbox({tools_button->Render(), text("  "),
-                          skills_button->Render()}),
-                }) | flex,
+        Element body;
+        if (st->page_idx == 0) {
+            const bool custom = st->model_idx ==
+                                static_cast<int>(st->model_choices.size()) - 1;
+            std::vector<Element> model_fields{
+                text("LLM provider") | bold | color(pal.accent),
+                paragraph("Choose which account handles new turns. Each "
+                          "provider retains its own key and model.") |
+                    color(pal.muted),
+                provider_menu->Render() | frame | size(HEIGHT, LESS_THAN, 6),
+                text(""),
+                text(providerLabel(provider) + " model") | bold |
+                    color(pal.accent),
+                paragraph("Choose a curated model or select Custom to enter "
+                          "any provider-supported model ID.") |
+                    color(pal.muted),
+                model_menu->Render() | frame | size(HEIGHT, LESS_THAN, 9),
+            };
+            if (custom) {
+                model_fields.push_back(text(""));
+                model_fields.push_back(
+                    text("Custom model ID") | bold | color(pal.accent));
+                model_fields.push_back(blockCursorInput(custom_model_input));
+            }
+            model_fields.push_back(text(""));
+            model_fields.push_back(
+                text("Reasoning effort") | bold | color(pal.accent));
+            model_fields.push_back(
+                paragraph("Only levels supported by this model are shown. "
+                          "Auto uses the model default.") |
+                color(pal.muted));
+            model_fields.push_back(effort_menu->Render() | frame |
+                                   size(HEIGHT, LESS_THAN, 8));
+            model_fields.push_back(text(""));
+            model_fields.push_back(
+                text(providerLabel(provider) + " API key") | bold |
+                    color(pal.accent));
+            model_fields.push_back(blockCursorInput(key_input));
+            model_fields.push_back(
+                paragraph("Stored in your config with 0600 permissions. The "
+                          + providerInfo(provider).environment_variable +
+                          " environment variable overrides this value.") |
+                color(pal.muted));
+            body = vbox(std::move(model_fields));
+        } else if (st->page_idx == 1) {
+            body = vbox({
+                text("Agent technique") | bold | color(pal.accent),
+                paragraph("Controls how each request is planned and repeated.") |
+                    color(pal.muted),
+                technique_menu->Render() | frame |
+                    size(HEIGHT, LESS_THAN, 8),
+                text(""),
+                text("Execution limits") | bold | color(pal.accent),
+                hbox({text("Tool-call limit        ") |
+                          size(WIDTH, EQUAL, 24),
+                      blockCursorInput(iters_input)}),
+                text("Maximum tool calls in one standard ReAct pass.") |
+                    color(pal.muted),
+                hbox({text("Ralph passes           ") |
+                          size(WIDTH, EQUAL, 24),
+                      blockCursorInput(ralph_input)}),
+                text("Goal repetitions when Ralph Loop is selected.") |
+                    color(pal.muted),
+                hbox({text("Plugin passes          ") |
+                          size(WIDTH, EQUAL, 24),
+                      blockCursorInput(plugin_iters_input)}),
+                text("Maximum passes for runtime technique plugins.") |
+                    color(pal.muted),
+                hbox({text("Temperature            ") |
+                          size(WIDTH, EQUAL, 24),
+                      blockCursorInput(temp_input)}),
+                text("Sampling temperature; negative values omit the setting.") |
+                    color(pal.muted),
+                text(""),
+                text("Agent instructions") | bold | color(pal.accent),
+                paragraph("Edit the workspace tool and skill instructions. "
+                          "Changes apply on the next turn.") |
+                    color(pal.muted),
+                hbox({tools_button->Render(), text("  "),
+                      skills_button->Render()}),
             });
+        } else if (st->page_idx == 2) {
+            body = vbox({
+                text("Color theme") | bold | color(pal.accent),
+                paragraph("Choose the palette used across OVI-CODE. Save "
+                          "changes to apply it to the chat screen.") |
+                    color(pal.muted),
+                text(""),
+                theme_menu->Render() | frame | size(HEIGHT, LESS_THAN, 6),
+            });
+        } else {
+            body = vbox({
+                text("Chat keyboard shortcuts") | bold | color(pal.accent),
+                separator(),
+                hbox({text("Insert mode") | bold | size(WIDTH, EQUAL, 18),
+                      text("Type; Enter adds a line; Esc enters Normal mode")}),
+                hbox({text("Move") | bold | size(WIDTH, EQUAL, 18),
+                      text("h/j/k/l, w/b, 0/$, gg/G")}),
+                hbox({text("Edit") | bold | size(WIDTH, EQUAL, 18),
+                      text("i/a/o/O/I/A, x, dd, yy, p/P")}),
+                hbox({text("Send") | bold | size(WIDTH, EQUAL, 18),
+                      text("Enter from Normal mode")}),
+                hbox({text("Output") | bold | size(WIDTH, EQUAL, 18),
+                      text("Ctrl+W focus; j/k scroll; g/G top/bottom")}),
+                hbox({text("Panels") | bold | size(WIDTH, EQUAL, 18),
+                      text("z minimize input; Ctrl+W return to input")}),
+                hbox({text("App") | bold | size(WIDTH, EQUAL, 18),
+                      text("s settings; t technique; c clear; q quit")}),
+                text(""),
+                text("Settings navigation") | bold | color(pal.accent),
+                separator(),
+                hbox({text("Move") | bold | size(WIDTH, EQUAL, 18),
+                      text("j/k/h/l or arrows; Tab changes field")}),
+                hbox({text("Choose") | bold | size(WIDTH, EQUAL, 18),
+                      text("Space or Enter")}),
+                hbox({text("Edit field") | bold | size(WIDTH, EQUAL, 18),
+                      text("i or a; Esc returns to Normal mode")}),
+                hbox({text("Cancel") | bold | size(WIDTH, EQUAL, 18),
+                      text("q or Esc from Normal mode")}),
+            });
+        }
 
         // Cap the whole panel to the live terminal height so it never exceeds
         // the screen (border included); the flexing yframe body absorbs the
@@ -859,12 +1075,16 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         Element content = vbox({
                    banner(pal, "settings"),
                    text(""),
-                   form | yframe | flex,
+                   page_menu->Render() | center,
+                   separator(),
+                   body | yframe | flex,
                    separator(),
                    hbox({
                        save_button->Render(),
                        text("  "),
                        cancel_button->Render(),
+                       text("  Changes apply to the next turn") |
+                           color(pal.muted),
                        filler(),
                        text(mode == ChatMode::Insert ? " -- INSERT -- "
                                                      : " -- NORMAL -- ") |
@@ -873,9 +1093,9 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                            bold,
                    }),
                    text(mode == ChatMode::Insert
-                            ? "INSERT · type · Esc → NORMAL"
-                            : "NORMAL · j k move · Space select · Tab field · "
-                              "i a edit · Enter activate · q/Esc cancel") |
+                             ? "INSERT · type · Esc → NORMAL"
+                             : "NORMAL · j/k choose · Tab field/list · "
+                               "Enter button · i/a edit · q cancel") |
                        color(pal.muted) | center,
                }) |
                color(pal.foreground);
@@ -1523,25 +1743,18 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         std::lock_guard<std::mutex> lk(mu);
         pushEntryLocked({TranscriptEntry::Kind::System, "welcome",
                           std::string("Workspace: ") + workspace.string() +
-                               "  ·  Provider: OpenRouter" +
-                               "  ·  Model: " + cfg.model +
-                              "  ·  Effort: " +
-                              reasoningEffortLabel(effectiveReasoningEffort(
-                                  cfg.model, cfg.reasoning_effort)) +
+                               "  ·  Provider: " + providerLabel(cfg.provider) +
+                               "  ·  Model: " + selectedModel(cfg) +
+                               "  ·  Effort: " +
+                               reasoningEffortLabel(effectiveReasoningEffort(
+                                   cfg.provider, selectedModel(cfg),
+                                   cfg.reasoning_effort)) +
                               "  ·  Technique: " +
                               selectedTechniqueLabel(cfg, plugins)});
         for (const auto& error : plugins.errors()) {
             pushEntryLocked(
                 {TranscriptEntry::Kind::Error, "plugin loader", error});
         }
-        pushEntryLocked(
-            {TranscriptEntry::Kind::System, "hints",
-              "INSERT: type freely · Enter = newline · Esc → NORMAL.   "
-              "NORMAL: Enter sends · h j k l move · w b word · 0 $ line · "
-              "gg G top/bot · i a o O I A insert · x delete · dd cut line · "
-              "yy copy line · p/P paste · "
-              "Ctrl+W focus output (j/k scroll) · q quit · s settings · "
-             "t technique · c clear · z toggle min."});
     }
 
     auto screen = ScreenInteractive::Fullscreen();
@@ -1554,6 +1767,11 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     bool settings_open = false;
     bool file_editor_open = false;
     ChatMode settings_mode = ChatMode::Normal;
+    Provider provider_before_settings = cfg.provider;
+    std::string model_before_settings = selectedModel(cfg);
+    std::string key_before_settings =
+        providerAccount(cfg, cfg.provider).api_key;
+    ReasoningEffort effort_before_settings = cfg.reasoning_effort;
 
     // Hide the modal and, on Save, note the new config in the transcript. The
     // panel writes straight into `cfg`, so AgentContext picks it up on the next
@@ -1562,13 +1780,26 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         settings_open = false;
         settings_mode = ChatMode::Normal;
         if (changed) {
+            const bool account_changed =
+                provider_before_settings != cfg.provider ||
+                model_before_settings != selectedModel(cfg) ||
+                key_before_settings !=
+                    providerAccount(cfg, cfg.provider).api_key ||
+                effort_before_settings != cfg.reasoning_effort;
+            if (account_changed) messages.clear();
             std::lock_guard<std::mutex> lk(mu);
             pushEntryLocked(
                 {TranscriptEntry::Kind::System, "settings",
-                 std::string("Now using OpenRouter / ") + cfg.model + " / " +
-                     reasoningEffortLabel(effectiveReasoningEffort(
-                         cfg.model, cfg.reasoning_effort)) + " effort / " +
-                     selectedTechniqueLabel(cfg, plugins)});
+                  std::string("Now using ") + providerLabel(cfg.provider) +
+                      " / " + selectedModel(cfg) + " / " +
+                      reasoningEffortLabel(effectiveReasoningEffort(
+                          cfg.provider, selectedModel(cfg),
+                          cfg.reasoning_effort)) + " effort / " +
+                      selectedTechniqueLabel(cfg, plugins) +
+                      (account_changed
+                           ? ". Started a new conversation for this account "
+                             "or model."
+                           : "")});
         }
     };
     auto close_file_editor = [&](bool saved, const fs::path& path) {
@@ -1642,6 +1873,10 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             return;
         }
         settings.sync();
+        provider_before_settings = cfg.provider;
+        model_before_settings = selectedModel(cfg);
+        key_before_settings = providerAccount(cfg, cfg.provider).api_key;
+        effort_before_settings = cfg.reasoning_effort;
         settings_mode = ChatMode::Normal;
         settings_open = true;
     };
@@ -1774,25 +2009,17 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         std::string mode_tag = insert ? " -- INSERT -- " : " -- NORMAL -- ";
         Color mode_color = insert ? pal.insert_mode : pal.normal_mode;
 
-        std::string footer =
-            insert
-                ? "INSERT  ·  Enter newline  ·  Esc → NORMAL"
-                : output_focused
-                ? "OUTPUT  ·  j k scroll  ·  g G top/bottom  ·  Ctrl+W → input"
-                : "NORMAL  ·  Enter send  ·  h j k l move  ·  w b word  ·  "
-                  "i a o O I A insert  ·  x dd  ·  yy p P  ·  z min  ·  "
-                  "Ctrl+W output  ·  q s t c";
-
         Element header_content =
             hbox({
                 text("OVI-CODE") | bold | color(pal.accent),
                 text("  "),
-                text("OpenRouter") | color(pal.muted),
+                text(providerLabel(cfg.provider)) | color(pal.muted),
                 text(" · "),
-                text(cfg.model) | color(pal.muted),
+                text(selectedModel(cfg)) | color(pal.muted),
                 text(" · "),
                 text(reasoningEffortLabel(effectiveReasoningEffort(
-                         cfg.model, cfg.reasoning_effort)) + " effort") |
+                         cfg.provider, selectedModel(cfg),
+                         cfg.reasoning_effort)) + " effort") |
                     color(pal.muted),
                 text(" · "),
                 text(selectedTechniqueLabel(cfg, plugins)) |
@@ -1855,7 +2082,6 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                      header_bar,
                      output_panel,
                      input_panel,
-                     text(footer) | color(pal.muted) | center,
                  }) |
                      flex);
     });

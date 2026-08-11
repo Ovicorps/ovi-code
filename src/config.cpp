@@ -1,5 +1,6 @@
 #include "ovicode/config.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <system_error>
@@ -10,6 +11,40 @@ namespace ovicode {
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+
+const std::vector<ProviderInfo>& knownProviders() {
+    static const std::vector<ProviderInfo> providers = {
+        {Provider::OpenRouter, "openrouter", "OpenRouter",
+         "OPENROUTER_API_KEY", "sk-or-v1-..."},
+        {Provider::OpenAI, "openai", "OpenAI", "OPENAI_API_KEY", "sk-..."},
+        {Provider::Anthropic, "anthropic", "Anthropic",
+         "ANTHROPIC_API_KEY", "sk-ant-..."},
+        {Provider::XAI, "xai", "xAI (Grok)", "XAI_API_KEY", "xai-..."},
+    };
+    return providers;
+}
+
+const ProviderInfo& providerInfo(Provider provider) {
+    for (const auto& info : knownProviders()) {
+        if (info.provider == provider) return info;
+    }
+    return knownProviders().front();
+}
+
+std::string providerLabel(Provider provider) {
+    return providerInfo(provider).label;
+}
+
+Provider providerFromString(const std::string& value) {
+    if (value == "openai") return Provider::OpenAI;
+    if (value == "anthropic") return Provider::Anthropic;
+    if (value == "xai" || value == "grok") return Provider::XAI;
+    return Provider::OpenRouter;
+}
+
+std::string providerToString(Provider provider) {
+    return providerInfo(provider).id;
+}
 
 std::string techniqueLabel(Technique t) {
     switch (t) {
@@ -153,9 +188,9 @@ ReasoningEffort reasoningEffortFromString(const std::string& value) {
     return ReasoningEffort::Auto;
 }
 
-const std::vector<ModelInfo>& knownModelInfo() {
+const std::vector<ModelInfo>& knownModelInfo(Provider provider) {
     using E = ReasoningEffort;
-    static const std::vector<ModelInfo> models = {
+    static const std::vector<ModelInfo> openrouter = {
         {"anthropic/claude-sonnet-4.6",
          {E::Max, E::High, E::Medium, E::Low}, E::Auto},
         {"anthropic/claude-opus-5",
@@ -200,19 +235,47 @@ const std::vector<ModelInfo>& knownModelInfo() {
         {"openai/gpt-oss-120b",
          {E::High, E::Medium, E::Low}, E::Medium},
     };
-    return models;
+    static const std::vector<ModelInfo> openai = {
+        {"gpt-5.4", {E::XHigh, E::High, E::Medium, E::Low, E::None},
+         E::Auto, false},
+        {"gpt-5.4-mini", {E::XHigh, E::High, E::Medium, E::Low, E::None},
+         E::Auto, false},
+        {"gpt-5.4-nano", {E::High, E::Medium, E::Low, E::Minimal, E::None},
+         E::Auto, false},
+    };
+    static const std::vector<ModelInfo> anthropic = {
+        {"claude-sonnet-4-6", {E::Max, E::High, E::Medium, E::Low},
+         E::Auto, false},
+        {"claude-opus-4-6", {E::Max, E::High, E::Medium, E::Low},
+         E::Auto, false},
+        {"claude-haiku-4-5-20251001", {}, E::Auto},
+    };
+    static const std::vector<ModelInfo> xai = {
+        {"grok-4.3", {E::High, E::Medium, E::Low, E::None}, E::Auto, false},
+        {"grok-4.1-fast-reasoning", {}, E::Auto, false},
+        {"grok-4.1-fast-non-reasoning", {}, E::Auto},
+        {"grok-code-fast-1", {}, E::Auto, false},
+    };
+    switch (provider) {
+        case Provider::OpenRouter: return openrouter;
+        case Provider::OpenAI:     return openai;
+        case Provider::Anthropic:  return anthropic;
+        case Provider::XAI:        return xai;
+    }
+    return openrouter;
 }
 
-const ModelInfo* findModelInfo(const std::string& model) {
-    for (const auto& info : knownModelInfo()) {
+const ModelInfo* findModelInfo(Provider provider, const std::string& model) {
+    for (const auto& info : knownModelInfo(provider)) {
         if (info.id == model) return &info;
     }
     return nullptr;
 }
 
-std::vector<ReasoningEffort> reasoningEffortOptions(const std::string& model) {
+std::vector<ReasoningEffort> reasoningEffortOptions(
+    Provider provider, const std::string& model) {
     std::vector<ReasoningEffort> options{ReasoningEffort::Auto};
-    const ModelInfo* info = findModelInfo(model);
+    const ModelInfo* info = findModelInfo(provider, model);
     if (info) {
         options.insert(options.end(), info->supported_efforts.begin(),
                        info->supported_efforts.end());
@@ -220,9 +283,10 @@ std::vector<ReasoningEffort> reasoningEffortOptions(const std::string& model) {
     return options;
 }
 
-ReasoningEffort effectiveReasoningEffort(const std::string& model,
+ReasoningEffort effectiveReasoningEffort(Provider provider,
+                                         const std::string& model,
                                          ReasoningEffort configured) {
-    const ModelInfo* info = findModelInfo(model);
+    const ModelInfo* info = findModelInfo(provider, model);
     if (!info || info->supported_efforts.empty()) return ReasoningEffort::Auto;
     if (configured == ReasoningEffort::Auto) return info->auto_effort;
     for (ReasoningEffort supported : info->supported_efforts) {
@@ -231,17 +295,82 @@ ReasoningEffort effectiveReasoningEffort(const std::string& model,
     return info->auto_effort;
 }
 
-const std::vector<std::string>& knownModels() {
-    static const std::vector<std::string> models = [] {
-        std::vector<std::string> ids;
-        ids.reserve(knownModelInfo().size());
-        for (const auto& info : knownModelInfo()) ids.push_back(info.id);
-        return ids;
+const std::vector<std::string>& knownModels(Provider provider) {
+    static const auto all_models = [] {
+        std::vector<std::vector<std::string>> result;
+        result.reserve(knownProviders().size());
+        for (const auto& provider_info : knownProviders()) {
+            const auto& info = knownModelInfo(provider_info.provider);
+            std::vector<std::string> ids;
+            ids.reserve(info.size());
+            for (const auto& model : info) ids.push_back(model.id);
+            result.push_back(std::move(ids));
+        }
+        return result;
     }();
-    return models;
+    for (size_t i = 0; i < knownProviders().size(); ++i) {
+        if (knownProviders()[i].provider == provider) return all_models[i];
+    }
+    return all_models.front();
 }
 
-const std::string& defaultModel() { return knownModels().front(); }
+const std::string& defaultModel(Provider provider) {
+    return knownModels(provider).front();
+}
+
+ProviderAccount& providerAccount(Config& config, Provider provider) {
+    switch (provider) {
+        case Provider::OpenRouter: return config.openrouter;
+        case Provider::OpenAI:     return config.openai;
+        case Provider::Anthropic:  return config.anthropic;
+        case Provider::XAI:        return config.xai;
+    }
+    return config.openrouter;
+}
+
+const ProviderAccount& providerAccount(const Config& config,
+                                       Provider provider) {
+    switch (provider) {
+        case Provider::OpenRouter: return config.openrouter;
+        case Provider::OpenAI:     return config.openai;
+        case Provider::Anthropic:  return config.anthropic;
+        case Provider::XAI:        return config.xai;
+    }
+    return config.openrouter;
+}
+
+std::string& selectedModel(Config& config) {
+    return providerAccount(config, config.provider).model;
+}
+
+const std::string& selectedModel(const Config& config) {
+    return providerAccount(config, config.provider).model;
+}
+
+std::string effectiveApiKey(const Config& config, Provider provider) {
+    auto normalize = [](const std::string& value) {
+        size_t first = 0;
+        while (first < value.size() &&
+               std::isspace(static_cast<unsigned char>(value[first]))) {
+            ++first;
+        }
+        size_t last = value.size();
+        while (last > first &&
+               std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+            --last;
+        }
+        std::string key = value.substr(first, last - first);
+        if (key.starts_with("Bearer ")) key.erase(0, 7);
+        return key;
+    };
+    const char* environment_value =
+        std::getenv(providerInfo(provider).environment_variable.c_str());
+    if (environment_value && *environment_value) {
+        std::string key = normalize(environment_value);
+        if (!key.empty()) return key;
+    }
+    return normalize(providerAccount(config, provider).api_key);
+}
 
 fs::path defaultConfigDir() {
     const char* home = std::getenv("HOME");
@@ -287,29 +416,69 @@ std::optional<Config> loadConfig(const fs::path& path) {
         return std::nullopt;
     }
     Config c;
-    c.model = j.value("model", defaultModel());
-    c.openrouter_api_key = j.value("openrouter_api_key", std::string{});
+    try {
+        const std::string provider_id = j.value("provider", "openrouter");
+        c.provider = providerFromString(provider_id);
 
-    // Older configs stored provider-native model names. Prefix the known ones
-    // so they remain usable through OpenRouter after migration.
-    if (c.model.find('/') == std::string::npos) {
-        const std::string provider = j.value("provider", "");
-        if (provider == "anthropic") c.model = "anthropic/" + c.model;
-        else if (provider == "openai") c.model = "openai/" + c.model;
-        else if (provider == "gemini") c.model = "google/" + c.model;
-        else if (provider == "cerebras" && c.model == "gpt-oss-120b")
-            c.model = "openai/" + c.model;
+        if (j.contains("accounts") && j["accounts"].is_object()) {
+            const auto& accounts = j["accounts"];
+            for (const auto& info : knownProviders()) {
+                if (!accounts.contains(info.id) ||
+                    !accounts[info.id].is_object()) {
+                    continue;
+                }
+                const auto& saved = accounts[info.id];
+                auto& account = providerAccount(c, info.provider);
+                account.model = saved.value("model", defaultModel(info.provider));
+                account.api_key = saved.value("api_key", std::string{});
+            }
+        } else if (provider_id == "openai" || provider_id == "anthropic" ||
+                   provider_id == "xai" || provider_id == "grok") {
+            // Configs from the earlier direct-provider implementation used one
+            // active api_key/model pair.
+            auto& account = providerAccount(c, c.provider);
+            account.model = j.value("model", defaultModel(c.provider));
+            account.api_key = j.value("api_key", std::string{});
+        } else {
+            // Migrate the OpenRouter-only format used by recent releases.
+            c.provider = Provider::OpenRouter;
+            c.openrouter.model =
+                j.value("model", defaultModel(Provider::OpenRouter));
+            c.openrouter.api_key = j.value(
+                "openrouter_api_key",
+                provider_id == "openrouter"
+                    ? j.value("api_key", std::string{})
+                    : std::string{});
+
+            // Older unsupported direct providers were routed through
+            // OpenRouter. Preserve that behavior for those persisted configs.
+            if (c.openrouter.model.find('/') == std::string::npos) {
+                if (provider_id == "gemini") {
+                    c.openrouter.model = "google/" + c.openrouter.model;
+                } else if (provider_id == "cerebras" &&
+                           c.openrouter.model == "gpt-oss-120b") {
+                    c.openrouter.model = "openai/" + c.openrouter.model;
+                }
+            }
+        }
+
+        for (const auto& info : knownProviders()) {
+            auto& account = providerAccount(c, info.provider);
+            if (account.model.empty()) account.model = defaultModel(info.provider);
+        }
+        c.technique_id = j.value("technique", std::string("standard"));
+        c.technique = techniqueFromString(c.technique_id);
+        c.theme = themeFromString(j.value("theme", "plain"));
+        c.reasoning_effort = reasoningEffortFromString(
+            j.value("reasoning_effort", std::string("auto")));
+        c.max_tool_iterations = j.value("max_tool_iterations", 12);
+        c.ralph_iterations = j.value("ralph_iterations", 3);
+        c.plugin_iterations = j.value("plugin_iterations", 3);
+        c.max_tokens = j.value("max_tokens", 4096);
+        c.temperature = j.value("temperature", 0.2);
+    } catch (...) {
+        return std::nullopt;
     }
-    c.technique_id = j.value("technique", std::string("standard"));
-    c.technique = techniqueFromString(c.technique_id);
-    c.theme = themeFromString(j.value("theme", "plain"));
-    c.reasoning_effort = reasoningEffortFromString(
-        j.value("reasoning_effort", std::string("auto")));
-    c.max_tool_iterations = j.value("max_tool_iterations", 12);
-    c.ralph_iterations = j.value("ralph_iterations", 3);
-    c.plugin_iterations = j.value("plugin_iterations", 3);
-    c.max_tokens = j.value("max_tokens", 4096);
-    c.temperature = j.value("temperature", 0.2);
     return c;
 }
 
@@ -317,8 +486,26 @@ bool saveConfig(const Config& cfg, const fs::path& path) {
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
     json j = {
-        {"model", cfg.model},
-        {"openrouter_api_key", cfg.openrouter_api_key},
+        {"version", 2},
+        {"provider", providerToString(cfg.provider)},
+        {"accounts", {
+            {"openrouter", {
+                {"model", cfg.openrouter.model},
+                {"api_key", cfg.openrouter.api_key},
+            }},
+            {"openai", {
+                {"model", cfg.openai.model},
+                {"api_key", cfg.openai.api_key},
+            }},
+            {"anthropic", {
+                {"model", cfg.anthropic.model},
+                {"api_key", cfg.anthropic.api_key},
+            }},
+            {"xai", {
+                {"model", cfg.xai.model},
+                {"api_key", cfg.xai.api_key},
+            }},
+        }},
         {"technique", cfg.technique_id.empty()
                           ? techniqueToString(cfg.technique)
                           : cfg.technique_id},
