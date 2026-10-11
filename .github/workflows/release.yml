@@ -4,23 +4,54 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build (for example, v0.1.1)
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Validate existing release tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" > /dev/null
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
   macos:
+    needs: resolve
     name: macOS ${{ matrix.arch }}
     strategy:
       matrix:
         include:
-          - runner: macos-15
+          - runner: macos-26
             arch: arm64
-          - runner: macos-15-intel
+          - runner: macos-26-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
 
       - name: Build
         run: |
@@ -33,6 +64,7 @@ jobs:
       - name: Verify binary
         run: |
           build/ovi-code --help
+          ctest --test-dir build --output-on-failure
           file build/ovi-code
           otool -L build/ovi-code
           if otool -L build/ovi-code | grep -Eq '/(opt/homebrew|usr/local)/'; then
@@ -61,7 +93,7 @@ jobs:
             ovi-code-darwin-${{ matrix.arch }}.tar.gz.sha256
 
   release:
-    needs: macos
+    needs: [resolve, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -73,11 +105,23 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "OVI-CODE ${GITHUB_REF_NAME}" \
-            --generate-notes
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            assets="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            for asset in dist/*; do
+              if printf '%s\n' "$assets" | grep -Fxq "$(basename "$asset")"; then
+                echo "Keeping existing asset: $(basename "$asset")"
+              else
+                gh release upload "$RELEASE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "OVI-CODE $RELEASE_TAG" \
+              --verify-tag --generate-notes
+          fi
 
   homebrew:
     needs: release

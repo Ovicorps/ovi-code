@@ -60,6 +60,16 @@ Missing credentials or release archives fail the workflow rather than publishing
 a cask with missing checksums. Keep the secret valid to maintain synchronization.
 The manual steps below remain available as a fallback.
 
+### Repair a release with missing macOS archives
+
+Run **Actions → Release → Run workflow** on `main`, entering the existing tag
+(for example, `v0.1.1`). The workflow builds and tests that exact tagged source
+on native Apple Silicon and Intel macOS 26 runners, uploads missing archives
+and checksums to the existing release, then synchronizes Homebrew. Existing
+assets are kept rather than replaced, preserving published checksums. The newer
+runner toolchain is required for the app's C++20 cancellation support; packaged
+binaries still target macOS 13 and newer.
+
 ## How the formula builds offline
 
 CMake fetches `nlohmann/json` and `FTXUI` via `FetchContent` at configure
