@@ -32,7 +32,8 @@ TUI.
 - Visible model responses, tool calls, tool results, and file diffs.
 - Workspace-sandboxed file tools.
 - Standard ReAct, Chain of Thought, Ralph Loop, and RAG techniques.
-- Runtime-loaded C++ modules for user-defined agentic techniques.
+- Runtime-loaded C++ modules for user-defined agentic techniques, including a
+  bundled configurable Deliberate example.
 - Project instructions through `agent.md`, `tools.md`, and `skills.md`.
 - Dark, light, system, and high-contrast plain themes.
 - Native Apple Silicon and Intel Homebrew cask packaging.
@@ -91,6 +92,10 @@ The first launch opens a five-step setup wizard:
 3. Select a curated model or enter a custom provider model ID.
 4. Select a reasoning effort supported by that model.
 5. Select the default agentic technique.
+
+The bundled **Deliberate** example plugin is preselected for fresh
+configurations. Choose another technique during setup if preferred. Deliberate
+can later be configured under **Settings → Plugins**.
 
 The configuration is saved to `~/.ovi-code/config.json` with permissions set
 to `0600`.
@@ -239,6 +244,7 @@ Settings include:
 - Ralph Loop iterations.
 - Maximum ReAct passes per plugin turn.
 - Temperature.
+- Options declared by installed plugins.
 - Built-in editors for `tools.md` and `skills.md`.
 
 Settings uses the same modal navigation style:
@@ -264,9 +270,11 @@ turn.
 | Chain of Thought | Adds a step-by-step reasoning preamble | Multi-step diagnosis and planning |
 | Ralph Loop | Repeats the goal for a configured number of improvement passes | Iterative refactors |
 | RAG | Searches the workspace for query keywords and prepends matching excerpts | Large or unfamiliar projects |
+| Deliberate [plugin] | Adds explicit hypotheses and verification before acting | Plugin demonstration and verification-focused work |
 
 Press `t` in Normal mode to cycle techniques quickly, or choose one in
-Settings.
+Settings. Deliberate is installed and active by default for fresh
+configurations; existing users keep their saved technique.
 
 ## Technique Plugins
 
@@ -280,13 +288,14 @@ without recompiling or relinking the application.
 
 ### Discovering Plugins
 
-OVI-CODE loads `.dylib` and `.so` modules from:
+Without an override, OVI-CODE loads `.dylib` and `.so` modules from the
+`plugins` directory beside the executable, the CMake prefix location
+`lib/ovi-code/plugins`, and the user directory `~/.ovi-code/plugins`. The first
+two locations contain the bundled Deliberate example in source builds,
+portable archives, and prefix installations.
 
-```text
-~/.ovi-code/plugins
-```
-
-Use another directory with either form:
+Use only another directory, replacing the default search list, with either
+form:
 
 ```bash
 ovi-code --plugin-dir /path/to/plugins
@@ -297,7 +306,6 @@ List loaded modules and loader errors without opening the TUI:
 
 ```bash
 ovi-code plugins
-ovi-code plugins --plugin-dir ./build/plugins
 ```
 
 Plugins are discovered once at process startup. Restart OVI-CODE after adding
@@ -306,17 +314,20 @@ reported as an error and is never silently replaced by a built-in technique.
 
 ### Building The Example
 
-The source tree includes `plugins/examples/deliberate.cpp`. It is built by
-default with the application:
+The source tree includes `plugins/examples/deliberate.cpp`. It is built,
+discovered, and installed by default with the application:
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
-./build/ovi-code plugins --plugin-dir ./build/plugins
-./build/ovi-code --plugin-dir ./build/plugins
+./build/ovi-code plugins
+./build/ovi-code
 ```
 
-Select **Deliberate [plugin]** during setup or from Settings.
+Fresh configurations select **Deliberate [plugin]** automatically. Its
+**Verification depth** and **Show start message** options appear under
+**Settings → Plugins**. Configure with `-DOVI_CODE_BUILD_EXAMPLE_PLUGINS=OFF`
+to omit it.
 
 ### Writing A Plugin
 
@@ -329,7 +340,7 @@ Plugins include the public, dependency-free ABI header:
 
 namespace {
 
-int runTurn(void*, const OviCodeTechniqueHostV1* host,
+int runTurn(void*, const OviCodeTechniqueHostV2* host,
             const char* user_input) {
     if (!host || !host->run_react || !user_input) return 0;
 
@@ -338,11 +349,19 @@ int runTurn(void*, const OviCodeTechniqueHostV1* host,
     return host->run_react(host->context, system.c_str(), user_input);
 }
 
-const OviCodeTechniquePluginV1 plugin{
-    OVI_CODE_TECHNIQUE_PLUGIN_API_VERSION,
+const char* const modes[] = {"quick", "careful"};
+const OviCodePluginParameterV2 parameters[] = {
+    {"mode", "Verification mode", "How thoroughly to check assumptions.",
+     OVI_CODE_PLUGIN_PARAMETER_CHOICE, "quick", modes, 2},
+};
+
+const OviCodeTechniquePluginV2 plugin{
+    OVI_CODE_TECHNIQUE_PLUGIN_API_VERSION_V2,
     "verify-first",
     "Verify First",
     "Checks assumptions before acting",
+    parameters,
+    1,
     nullptr,
     nullptr,
     runTurn,
@@ -350,8 +369,8 @@ const OviCodeTechniquePluginV1 plugin{
 
 }  // namespace
 
-extern "C" const OviCodeTechniquePluginV1*
-ovi_code_get_technique_plugin_v1() {
+extern "C" const OviCodeTechniquePluginV2*
+ovi_code_get_technique_plugin_v2() {
     return &plugin;
 }
 ```
@@ -376,9 +395,12 @@ with a lowercase letter or digit and contain only lowercase letters, digits,
 
 ### Runtime Interface
 
-The exported `ovi_code_get_technique_plugin_v1` function returns one
-`OviCodeTechniquePluginV1` descriptor. The versioned C ABI keeps module loading
-consistent while allowing plugin implementations to use C++ internally.
+The exported `ovi_code_get_technique_plugin_v2` function returns one
+`OviCodeTechniquePluginV2` descriptor. V2 descriptors can declare string,
+secret, integer, number, boolean, and choice settings. OVI-CODE renders them in
+**Settings → Plugins**, persists values per plugin, and exposes the effective
+value through `host->get_parameter`. V1 plugins remain loadable but cannot
+declare settings.
 
 | Field or callback | Purpose |
 | --- | --- |
@@ -391,6 +413,7 @@ consistent while allowing plugin implementations to use C++ internally.
 | `host->last_assistant_text` | Inspect the latest response for loop stop conditions |
 | `host->emit` | Write System or Error status to the transcript |
 | `host->iteration_limit` | Maximum host-enforced ReAct passes for this turn |
+| `host->get_parameter` | Read a V2 setting or its declared default |
 
 A plugin can call `run_react` more than once to implement refinement, critic,
 or Ralph-style loops. The host stops calls beyond the **Plugin passes** setting.
@@ -472,7 +495,7 @@ ovi-code [command] [options]
 | `--workspace <dir>` | Set the workspace root; defaults to the current directory |
 | `--agent-config-dir <dir>` | Set the directory containing `agent.md`, `tools.md`, and `skills.md` |
 | `--config <file>` | Use a custom application configuration path |
-| `--plugin-dir <dir>` | Load runtime technique plugins from another directory |
+| `--plugin-dir <dir>` | Replace default plugin discovery with one directory |
 | `--setup` | Run the setup wizard again |
 | `--init` | Alias for the `init` command |
 | `--list-plugins` | Alias for the `plugins` command |

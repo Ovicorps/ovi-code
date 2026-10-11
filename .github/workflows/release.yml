@@ -44,7 +44,12 @@ jobs:
         run: |
           mkdir -p stage
           cmake --install build --prefix stage
-          tar -C stage/bin -czf "ovi-code-darwin-${{ matrix.arch }}.tar.gz" ovi-code
+          mkdir -p package/plugins
+          cp stage/bin/ovi-code package/ovi-code
+          cp stage/lib/ovi-code/plugins/* package/plugins/
+          package/ovi-code plugins | grep -q deliberate
+          tar -C package -czf "ovi-code-darwin-${{ matrix.arch }}.tar.gz" \
+            ovi-code plugins
           shasum -a 256 "ovi-code-darwin-${{ matrix.arch }}.tar.gz" \
             > "ovi-code-darwin-${{ matrix.arch }}.tar.gz.sha256"
 

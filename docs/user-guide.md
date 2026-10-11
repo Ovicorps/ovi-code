@@ -57,14 +57,19 @@ while output is focused.
 
 ## Settings
 
-Press ++s++ from Normal mode. Settings are organized into four tabs:
+Press ++s++ from Normal mode. Settings are organized into five tabs:
 
 | Tab | Contents |
 | --- | --- |
 | **Model** | Provider account, model, reasoning effort, and provider API key |
 | **Agent** | Technique, execution limits, temperature, and instruction editors |
 | **Appearance** | System, dark, light, and plain themes |
+| **Plugins** | Options declared by installed technique plugins |
 | **Shortcuts** | Chat and Settings keyboard reference |
+
+The bundled **Deliberate** example exposes **Verification depth** and **Show
+start message** in the Plugins tab. Fresh configurations use Deliberate by
+default; change the active technique in the Agent tab or with ++t++.
 
 Use ++tab++ to move between controls (or cycle a focused list) and ++j++ /
 ++k++ or arrow keys to change list selections. Press ++enter++ to activate a

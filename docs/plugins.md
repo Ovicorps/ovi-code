@@ -8,15 +8,30 @@ against OVI-CODE internals.
     A plugin has the same operating-system permissions as OVI-CODE. It is not
     sandboxed. Install only plugins whose source and publisher you trust.
 
+## Bundled example
+
+OVI-CODE ships with the **Deliberate** example plugin. It is installed and
+loaded automatically, and fresh configurations select it as the default
+technique so you can see a plugin working immediately. Existing configurations
+keep their saved technique.
+
+Deliberate adds explicit hypothesis and verification instructions before a
+normal ReAct pass. Its **Verification depth** and **Show start message** options
+are available under **Settings → Plugins**. You can select another technique at
+any time under **Settings → Agent** or by pressing ++t++ in chat Normal mode.
+
 ## Discover plugins
 
-The default plugin directory is:
+Without an override, OVI-CODE searches:
 
-```text
-~/.ovi-code/plugins
-```
+1. The `plugins` directory beside the executable. Source builds and portable
+   release archives keep the bundled Deliberate module here.
+2. `<install-prefix>/lib/ovi-code/plugins` for CMake prefix installs.
+3. `~/.ovi-code/plugins` for plugins installed by the user.
 
-Override it with a flag or environment variable:
+Use a flag or environment variable to replace that search list with one
+directory. This also disables the bundled example for that run unless it is in
+the selected directory:
 
 ```bash
 ovi-code --plugin-dir /path/to/plugins
@@ -27,26 +42,30 @@ List loaded modules and loader errors without opening the TUI:
 
 ```bash
 ovi-code plugins
-ovi-code plugins --plugin-dir ./build/plugins
 ```
 
 OVI-CODE loads `.dylib` and `.so` files once at startup. Restart after adding or
 rebuilding a plugin.
 
-## Build the example
+## Build the bundled example
 
 The repository includes `plugins/examples/deliberate.cpp`, built by default:
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
-./build/ovi-code plugins --plugin-dir ./build/plugins
-./build/ovi-code --plugin-dir ./build/plugins
+./build/ovi-code plugins
+./build/ovi-code
 ```
+
+The build-tree plugin directory is discovered automatically. Set
+`-DOVI_CODE_BUILD_EXAMPLE_PLUGINS=OFF` when configuring CMake to omit the
+example from both the build and installation.
 
 ## Write a plugin
 
-Plugins include the dependency-free public ABI header:
+Plugins include the dependency-free public ABI header. Use the V2 descriptor
+to declare settings that appear under **Settings → Plugins**:
 
 ```cpp
 #include "ovicode/technique_plugin.h"
@@ -55,7 +74,7 @@ Plugins include the dependency-free public ABI header:
 
 namespace {
 
-int runTurn(void*, const OviCodeTechniqueHostV1* host,
+int runTurn(void*, const OviCodeTechniqueHostV2* host,
             const char* user_input) {
     if (!host || !host->run_react || !user_input) return 0;
 
@@ -64,11 +83,21 @@ int runTurn(void*, const OviCodeTechniqueHostV1* host,
     return host->run_react(host->context, system.c_str(), user_input);
 }
 
-const OviCodeTechniquePluginV1 plugin{
-    OVI_CODE_TECHNIQUE_PLUGIN_API_VERSION,
+const char* const modes[] = {"quick", "careful"};
+const OviCodePluginParameterV2 parameters[] = {
+    {"mode", "Verification mode", "How thoroughly to check assumptions.",
+     OVI_CODE_PLUGIN_PARAMETER_CHOICE, "quick", modes, 2},
+    {"notes", "Extra instructions", "Additional text added to the prompt.",
+     OVI_CODE_PLUGIN_PARAMETER_STRING, "", nullptr, 0},
+};
+
+const OviCodeTechniquePluginV2 plugin{
+    OVI_CODE_TECHNIQUE_PLUGIN_API_VERSION_V2,
     "verify-first",
     "Verify First",
     "Checks assumptions before acting",
+    parameters,
+    2,
     nullptr,
     nullptr,
     runTurn,
@@ -76,8 +105,8 @@ const OviCodeTechniquePluginV1 plugin{
 
 }  // namespace
 
-extern "C" const OviCodeTechniquePluginV1*
-ovi_code_get_technique_plugin_v1() {
+extern "C" const OviCodeTechniquePluginV2*
+ovi_code_get_technique_plugin_v2() {
     return &plugin;
 }
 ```
@@ -102,6 +131,32 @@ Plugin IDs must start with a lowercase letter or digit and contain only
 lowercase letters, digits, `.`, `_`, or `-`. They must not duplicate another
 plugin or built-in technique ID.
 
+V1 plugins remain supported and continue exporting
+`ovi_code_get_technique_plugin_v1`, but only V2 plugins can declare settings.
+
+## Define settings
+
+Each V2 parameter has a stable `key`, user-facing `label` and `description`, a
+type, and a default value. Supported types are `STRING`, `SECRET`, `INTEGER`,
+`NUMBER`, `BOOLEAN`, and `CHOICE`. Choice parameters also provide an array of
+accepted values. Keys follow the same character rules as plugin IDs and must be
+unique within the plugin.
+
+Values are stored per plugin in `~/.ovi-code/config.json`. Read the effective
+value during a turn with `host->get_parameter`:
+
+```cpp
+const char* mode = host->get_parameter(host->context, "mode");
+if (mode && std::string(mode) == "careful") {
+    // Enable the plugin's more thorough behavior.
+}
+```
+
+The host validates values and falls back to the declared default if a manually
+edited configuration contains an invalid value. Returned pointers remain valid
+until `run_turn` returns. Secret parameters are masked in Settings, but are
+stored in the same user-readable configuration file as provider keys.
+
 ## Runtime interface
 
 | Field or callback | Purpose |
@@ -115,6 +170,7 @@ plugin or built-in technique ID.
 | `host->last_assistant_text` | Inspect the latest assistant response |
 | `host->emit` | Write System or Error transcript entries |
 | `host->iteration_limit` | Maximum host-enforced passes for the turn |
+| `host->get_parameter` | Read a V2 plugin setting or its default |
 
 Pointers supplied by the host are valid only during `run_turn`; copy data that
 must be retained. Never allow C++ exceptions to cross the exported C ABI.

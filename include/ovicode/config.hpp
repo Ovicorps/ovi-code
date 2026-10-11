@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -106,7 +108,11 @@ struct Config {
     int ralph_iterations = 3;
     int plugin_iterations = 3;
     int max_tokens = 4096;
+    std::size_t max_context_bytes = 2 * 1024 * 1024;
+    std::size_t max_request_bytes = 4 * 1024 * 1024;
     double temperature = 0.2;
+    // plugin id -> parameter key -> serialized value
+    std::map<std::string, std::map<std::string, std::string>> plugin_parameters;
 };
 
 ProviderAccount& providerAccount(Config& config, Provider provider);

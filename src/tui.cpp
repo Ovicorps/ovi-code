@@ -2,13 +2,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <charconv>
 #include <cctype>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -21,9 +23,15 @@
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/screen/screen.hpp>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "ovicode/agent_md.hpp"
+#include "ovicode/metrics.hpp"
 #include "ovicode/providers.hpp"
 #include "ovicode/react.hpp"
+#include "ovicode/transcript.hpp"
+#include "ovicode/utf8.hpp"
 
 namespace ovicode {
 
@@ -410,6 +418,53 @@ Element blockCursorInput(const Component& input) {
     return input->Focused() ? focusCursorBlock(std::move(e)) : e;
 }
 
+// Keep menu navigation separate from its chosen value. Arrow/j/k movement only
+// changes `cursor`; Space, Enter, or a mouse click commits it to `selected`.
+Component confirmedChoiceMenu(std::vector<std::string>* choices, int* selected,
+                              int* cursor) {
+    MenuOption option = MenuOption::Vertical();
+    option.entries_option.transform = [choices, selected](
+                                             const EntryState& state) {
+        const bool chosen =
+            *selected >= 0 && *selected < static_cast<int>(choices->size()) &&
+            state.label == (*choices)[*selected];
+        Element entry = text((chosen ? "(*) " : "( ) ") + state.label);
+        if (state.focused) entry |= inverted;
+        if (chosen) entry |= bold;
+        return entry;
+    };
+    option.on_enter = [selected, cursor] { *selected = *cursor; };
+
+    auto list = Menu(choices, cursor, option);
+    return CatchEvent(list, [selected, cursor, list](Event event) {
+        if (event == Event::Character(" ")) {
+            *selected = *cursor;
+            return true;
+        }
+        if (event.is_mouse() && event.mouse().button == Mouse::Left &&
+            event.mouse().motion == Mouse::Released && list->OnEvent(event)) {
+            *selected = *cursor;
+            return true;
+        }
+        return false;
+    });
+}
+
+bool parseBudgetKiB(const std::string& text, std::size_t max_kib,
+                    std::size_t& bytes) {
+    if (text.empty()) return false;
+    std::size_t kib = 0;
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    const auto parsed = std::from_chars(begin, end, kib);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || kib < 64 ||
+        kib > max_kib) {
+        return false;
+    }
+    bytes = kib * 1024;
+    return true;
+}
+
 }  // namespace
 
 // -- Setup wizard -----------------------------------------------------------
@@ -680,26 +735,45 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
 
 namespace {
 
+struct PluginSettingField {
+    std::string plugin_id;
+    std::string plugin_label;
+    PluginParameter parameter;
+    std::string value;
+    std::vector<std::string> choices;
+    int choice_idx = 0;
+    int choice_cursor_idx = 0;
+    Component control;
+};
+
 // Mutable state backing the settings modal. Held by shared_ptr so the pointers
 // bound into the Radiobox/Input components stay valid for the whole lifetime of
 // the panel (which now lives as long as the chat screen, not a single Loop).
 struct SettingsState {
     int page_idx = 0;
     int provider_idx = 0;
+    int provider_cursor_idx = 0;
     int technique_idx = 0;
+    int technique_cursor_idx = 0;
     int theme_idx = 0;
+    int theme_cursor_idx = 0;
     int model_idx = 0;
+    int model_cursor_idx = 0;
     int effort_idx = 0;
+    int effort_cursor_idx = 0;
     Provider loaded_provider = Provider::OpenRouter;
     Provider effort_provider = Provider::OpenRouter;
     Config staged;
     std::string api_key, model, max_iters_s, ralph_s, plugin_iters_s, temp_s;
+    std::string context_kib_s, request_kib_s;
+    std::string context_kib_original, request_kib_original;
     std::string effort_model;
     std::vector<ReasoningEffort> effort_options;
     std::vector<std::string> page_choices{
-        "Model", "Agent", "Appearance", "Shortcuts"};
+        "Model", "Agent", "Appearance", "Plugins", "Shortcuts"};
     std::vector<std::string> provider_choices, technique_ids,
         technique_choices, theme_choices, model_choices, effort_choices;
+    std::vector<PluginSettingField> plugin_fields;
 };
 
 // The settings panel as an embeddable modal: `component` is layered over the
@@ -733,11 +807,17 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
 
     // Menus track externally synchronized indices, which matters when changing
     // providers replaces the model and effort lists in place.
-    auto provider_menu = Menu(&st->provider_choices, &st->provider_idx);
-    auto technique_menu = Menu(&st->technique_choices, &st->technique_idx);
-    auto theme_menu = Menu(&st->theme_choices, &st->theme_idx);
-    auto model_menu = Menu(&st->model_choices, &st->model_idx);
-    auto effort_menu = Menu(&st->effort_choices, &st->effort_idx);
+    auto provider_menu = confirmedChoiceMenu(
+        &st->provider_choices, &st->provider_idx, &st->provider_cursor_idx);
+    auto technique_menu = confirmedChoiceMenu(
+        &st->technique_choices, &st->technique_idx,
+        &st->technique_cursor_idx);
+    auto theme_menu = confirmedChoiceMenu(
+        &st->theme_choices, &st->theme_idx, &st->theme_cursor_idx);
+    auto model_menu = confirmedChoiceMenu(
+        &st->model_choices, &st->model_idx, &st->model_cursor_idx);
+    auto effort_menu = confirmedChoiceMenu(
+        &st->effort_choices, &st->effort_idx, &st->effort_cursor_idx);
     auto model_input =
         Input(&st->model, "model id", paletteInputOption(cfg));
     auto custom_model_input = Maybe(model_input, [st] {
@@ -770,6 +850,48 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                                     paletteInputOption(cfg));
     auto temp_input =
         Input(&st->temp_s, "temperature", paletteInputOption(cfg));
+    auto context_input =
+        Input(&st->context_kib_s, "context KiB", paletteInputOption(cfg));
+    auto request_input =
+        Input(&st->request_kib_s, "request KiB", paletteInputOption(cfg));
+
+    std::size_t parameter_count = 0;
+    for (const auto& plugin : plugins.plugins())
+        parameter_count += plugin->parameters.size();
+    st->plugin_fields.reserve(parameter_count);
+    for (const auto& plugin : plugins.plugins()) {
+        for (const auto& parameter : plugin->parameters) {
+            PluginSettingField field;
+            field.plugin_id = plugin->id;
+            field.plugin_label = plugin->label;
+            field.parameter = parameter;
+            field.value = parameter.default_value;
+            if (parameter.type == PluginParameterType::Boolean) {
+                field.choices = {"Disabled", "Enabled"};
+            } else if (parameter.type == PluginParameterType::Choice) {
+                field.choices = parameter.options;
+            }
+            st->plugin_fields.push_back(std::move(field));
+        }
+    }
+    std::vector<Component> plugin_controls;
+    plugin_controls.reserve(st->plugin_fields.size());
+    for (auto& field : st->plugin_fields) {
+        if (field.parameter.type == PluginParameterType::Boolean ||
+            field.parameter.type == PluginParameterType::Choice) {
+            field.control = confirmedChoiceMenu(
+                &field.choices, &field.choice_idx,
+                &field.choice_cursor_idx);
+        } else {
+            InputOption option = paletteInputOption(cfg);
+            option.password = field.parameter.type == PluginParameterType::Secret;
+            field.control = Input(&field.value, field.parameter.key, option);
+        }
+        plugin_controls.push_back(field.control);
+    }
+    if (plugin_controls.empty()) {
+        plugin_controls.push_back(Renderer([] { return text(""); }));
+    }
 
     auto current_model = [st] {
         if (st->model_idx >= 0 &&
@@ -793,6 +915,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         refreshReasoningEffortChoices(
             st->effort_provider, st->effort_model, selected, st->effort_options,
             st->effort_choices, st->effort_idx);
+        st->effort_cursor_idx = st->effort_idx;
     };
     auto save_account_fields = [st, current_model] {
         auto& account = providerAccount(st->staged, st->loaded_provider);
@@ -816,6 +939,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         if (st->model_idx < 0) {
             st->model_idx = static_cast<int>(st->model_choices.size()) - 1;
         }
+        st->model_cursor_idx = st->model_idx;
         refresh_effort(selected_effort);
     };
 
@@ -832,6 +956,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                 break;
             }
         }
+        st->provider_cursor_idx = st->provider_idx;
         st->technique_ids = techniqueIds(plugins);
         st->technique_choices = techniqueLabels(plugins);
         const std::string technique_id =
@@ -845,14 +970,49 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
             st->technique_idx =
                 static_cast<int>(st->technique_ids.size()) - 1;
         }
+        st->technique_cursor_idx = st->technique_idx;
         st->theme_idx = 0;
         const auto& themes = allThemes();
         for (size_t i = 0; i < themes.size(); ++i)
             if (themes[i] == cfg.theme) { st->theme_idx = (int)i; break; }
+        st->theme_cursor_idx = st->theme_idx;
         st->max_iters_s = std::to_string(cfg.max_tool_iterations);
         st->ralph_s = std::to_string(cfg.ralph_iterations);
         st->plugin_iters_s = std::to_string(cfg.plugin_iterations);
         st->temp_s = std::to_string(cfg.temperature);
+        st->context_kib_s =
+            std::to_string(cfg.max_context_bytes / 1024);
+        st->request_kib_s =
+            std::to_string(cfg.max_request_bytes / 1024);
+        st->context_kib_original = st->context_kib_s;
+        st->request_kib_original = st->request_kib_s;
+        for (auto& field : st->plugin_fields) {
+            field.value = field.parameter.default_value;
+            const auto plugin_values =
+                cfg.plugin_parameters.find(field.plugin_id);
+            if (plugin_values != cfg.plugin_parameters.end()) {
+                const auto configured =
+                    plugin_values->second.find(field.parameter.key);
+                if (configured != plugin_values->second.end()) {
+                    if (auto normalized = normalizePluginParameterValue(
+                            field.parameter, configured->second)) {
+                        field.value = std::move(*normalized);
+                    }
+                }
+            }
+            if (field.parameter.type == PluginParameterType::Boolean) {
+                field.choice_idx = field.value == "true" ? 1 : 0;
+            } else if (field.parameter.type == PluginParameterType::Choice) {
+                const auto selected = std::find(field.choices.begin(),
+                                                field.choices.end(),
+                                                field.value);
+                field.choice_idx = selected == field.choices.end()
+                                       ? 0
+                                       : static_cast<int>(selected -
+                                                          field.choices.begin());
+            }
+            field.choice_cursor_idx = field.choice_idx;
+        }
         load_provider_fields(cfg.provider, cfg.reasoning_effort);
     };
     sync();
@@ -888,6 +1048,30 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
             st->staged.temperature = std::stod(st->temp_s);
         } catch (...) {
         }
+        if (st->context_kib_s != st->context_kib_original) {
+            parseBudgetKiB(st->context_kib_s, 64 * 1024,
+                           st->staged.max_context_bytes);
+        }
+        if (st->request_kib_s != st->request_kib_original) {
+            parseBudgetKiB(st->request_kib_s, 128 * 1024,
+                           st->staged.max_request_bytes);
+        }
+        for (auto& field : st->plugin_fields) {
+            std::string value = field.value;
+            if (field.parameter.type == PluginParameterType::Boolean) {
+                value = field.choice_idx == 1 ? "true" : "false";
+            } else if (field.parameter.type == PluginParameterType::Choice &&
+                       field.choice_idx >= 0 &&
+                       field.choice_idx <
+                           static_cast<int>(field.choices.size())) {
+                value = field.choices[field.choice_idx];
+            }
+            auto normalized =
+                normalizePluginParameterValue(field.parameter, value);
+            st->staged.plugin_parameters[field.plugin_id][field.parameter.key] =
+                normalized ? std::move(*normalized)
+                           : field.parameter.default_value;
+        }
         cfg = st->staged;
         close(true);
     };
@@ -910,13 +1094,16 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         ralph_input,
         plugin_iters_input,
         temp_input,
+        context_input,
+        request_input,
         tools_button,
         skills_button,
     });
     auto appearance_page = Container::Vertical({theme_menu});
+    auto plugins_page = Container::Vertical(std::move(plugin_controls));
     auto shortcuts_page = Renderer([] { return text(""); });
     auto pages = Container::Tab(
-        {model_page, agent_page, appearance_page, shortcuts_page},
+        {model_page, agent_page, appearance_page, plugins_page, shortcuts_page},
         &st->page_idx);
     auto layout = Container::Vertical({
         page_menu,
@@ -959,8 +1146,9 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                 text(""),
                 text(providerLabel(provider) + " model") | bold |
                     color(pal.accent),
-                paragraph("Choose a curated model or select Custom to enter "
-                          "any provider-supported model ID.") |
+                paragraph("Highlight a model, then press Space to select it. "
+                          "Choose Custom to enter any provider-supported "
+                          "model ID.") |
                     color(pal.muted),
                 model_menu->Render() | frame | size(HEIGHT, LESS_THAN, 9),
             };
@@ -1019,6 +1207,16 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                       blockCursorInput(temp_input)}),
                 text("Sampling temperature; negative values omit the setting.") |
                     color(pal.muted),
+                hbox({text("Context budget (KiB)   ") |
+                          size(WIDTH, EQUAL, 24),
+                      blockCursorInput(context_input)}),
+                text("Older complete exchanges are compacted before requests.") |
+                    color(pal.muted),
+                hbox({text("Request ceiling (KiB)  ") |
+                          size(WIDTH, EQUAL, 24),
+                      blockCursorInput(request_input)}),
+                text("Serialized requests above this hard ceiling are rejected.") |
+                    color(pal.muted),
                 text(""),
                 text("Agent instructions") | bold | color(pal.accent),
                 paragraph("Edit the workspace tool and skill instructions. "
@@ -1036,6 +1234,37 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                 text(""),
                 theme_menu->Render() | frame | size(HEIGHT, LESS_THAN, 6),
             });
+        } else if (st->page_idx == 3) {
+            std::vector<Element> fields;
+            if (st->plugin_fields.empty()) {
+                fields.push_back(
+                    text("No loaded plugins define configurable parameters.") |
+                    color(pal.muted));
+            } else {
+                std::string last_plugin;
+                for (const auto& field : st->plugin_fields) {
+                    if (field.plugin_id != last_plugin) {
+                        if (!last_plugin.empty()) fields.push_back(separator());
+                        fields.push_back(text(field.plugin_label) | bold |
+                                         color(pal.accent));
+                        last_plugin = field.plugin_id;
+                    }
+                    fields.push_back(text(field.parameter.label) | bold);
+                    if (!field.parameter.description.empty()) {
+                        fields.push_back(paragraph(field.parameter.description) |
+                                         color(pal.muted));
+                    }
+                    if (field.parameter.type == PluginParameterType::Boolean ||
+                        field.parameter.type == PluginParameterType::Choice) {
+                        fields.push_back(field.control->Render() | frame |
+                                         size(HEIGHT, LESS_THAN, 6));
+                    } else {
+                        fields.push_back(blockCursorInput(field.control));
+                    }
+                    fields.push_back(text(""));
+                }
+            }
+            body = vbox(std::move(fields));
         } else {
             body = vbox({
                 text("Chat keyboard shortcuts") | bold | color(pal.accent),
@@ -1093,9 +1322,10 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                            bold,
                    }),
                    text(mode == ChatMode::Insert
-                             ? "INSERT · type · Esc → NORMAL"
-                             : "NORMAL · j/k choose · Tab field/list · "
-                               "Enter button · i/a edit · q cancel") |
+                              ? "INSERT · type · Esc → NORMAL"
+                              : "NORMAL · j/k move · Space choose · "
+                                "Tab field/list · Enter button · i/a edit · "
+                                "q cancel") |
                        color(pal.muted) | center,
                }) |
                color(pal.foreground);
@@ -1127,63 +1357,26 @@ Color kindColor(const Palette& pal, TranscriptEntry::Kind k) {
     return pal.foreground;
 }
 
-const char* kindLabel(TranscriptEntry::Kind k) {
-    switch (k) {
-        case TranscriptEntry::Kind::User:       return "you";
-        case TranscriptEntry::Kind::Assistant:  return "assistant";
-        case TranscriptEntry::Kind::ToolCall:   return "tool →";
-        case TranscriptEntry::Kind::ToolResult: return "tool ←";
-        case TranscriptEntry::Kind::System:     return "system";
-        case TranscriptEntry::Kind::Error:      return "error";
+Element renderTranscriptRow(const Palette& pal, const TranscriptRow& row) {
+    Element element = text(row.text.empty() ? " " : row.text);
+    switch (row.style) {
+        case TranscriptRowStyle::Header:
+            return element | color(kindColor(pal, row.kind)) | bold;
+        case TranscriptRowStyle::DiffAdd:
+            return element | color(pal.assistant_entry);
+        case TranscriptRowStyle::DiffRemove:
+            return element | color(pal.error);
+        case TranscriptRowStyle::DiffHunk:
+            return element | color(pal.accent) | bold;
+        case TranscriptRowStyle::DiffMeta:
+            return element | color(pal.muted);
+        case TranscriptRowStyle::Done:
+            return element | color(pal.assistant_entry) | bold;
+        case TranscriptRowStyle::Body:
+        case TranscriptRowStyle::Spacer:
+            return element | color(pal.foreground);
     }
-    return "?";
-}
-
-// A transcript body that begins with "--- a/" is treated as a unified-diff
-// block: per-line colorize `+`/`-`/`@` so edits read like a git diff.
-Element renderDiffBody(const Palette& pal, const std::string& body) {
-    std::vector<Element> rows;
-    std::istringstream is(body);
-    std::string line;
-    while (std::getline(is, line)) {
-        if (line.empty()) { rows.push_back(text(" ")); continue; }
-        char c = line[0];
-        if (c == '+')      rows.push_back(text(line) | color(pal.assistant_entry));
-        else if (c == '-') rows.push_back(text(line) | color(pal.error));
-        else if (c == '@') rows.push_back(text(line) | color(pal.accent) | bold);
-        else               rows.push_back(text(line) | color(pal.muted));
-    }
-    if (rows.empty()) rows.push_back(text(" "));
-    return vbox(std::move(rows));
-}
-
-Element renderEntry(const Palette& pal, const TranscriptEntry& e) {
-    // "done" is the synthetic marker the chat loop pushes when a turn
-    // finishes successfully — render it as a bold green banner.
-    if (e.kind == TranscriptEntry::Kind::System && e.title == "done") {
-        return vbox({
-                   text(std::string("✓ done · ") + e.body) |
-                       color(pal.assistant_entry) | bold,
-                   text(""),
-               }) |
-               xflex;
-    }
-    auto header = text(std::string("● ") + kindLabel(e.kind) +
-                       (e.title.empty() ? "" : " · " + e.title)) |
-                  color(kindColor(pal, e.kind)) | bold;
-    bool is_diff = e.body.rfind("--- a/", 0) == 0;
-    Element body;
-    if (is_diff) {
-        body = renderDiffBody(pal, e.body);
-    } else {
-        std::vector<Element> body_lines;
-        std::istringstream is(e.body);
-        std::string line;
-        while (std::getline(is, line)) body_lines.push_back(paragraph(line));
-        if (body_lines.empty()) body_lines.push_back(text(""));
-        body = vbox(body_lines) | color(pal.foreground);
-    }
-    return vbox({header, body, text("")}) | xflex;
+    return element;
 }
 
 // ---- Vim-style multi-line editor ----------------------------------------
@@ -1200,7 +1393,8 @@ struct VimClipboard {
 struct VimEditor {
     std::vector<std::string> lines{""};
     int row = 0;
-    int col = 0;
+    int col = 0;  // UTF-8 byte offset, always a grapheme boundary
+    int preferred_column = -1;
     ChatMode mode = ChatMode::Insert;
     std::string pending_op;  // first key of a 2-key motion like "dd"/"gg"
     std::string clipboard_notice;
@@ -1221,6 +1415,7 @@ struct VimEditor {
     void clearBuffer() {
         lines = {""};
         row = col = 0;
+        preferred_column = -1;
         pending_op.clear();
         clipboard_notice.clear();
     }
@@ -1238,6 +1433,7 @@ struct VimEditor {
             start = newline + 1;
         }
         row = col = 0;
+        preferred_column = -1;
         mode = ChatMode::Normal;
         pending_op.clear();
         clipboard_notice.clear();
@@ -1247,19 +1443,35 @@ struct VimEditor {
         if (lines.empty()) lines.push_back("");
         if (row < 0) row = 0;
         if (row >= (int)lines.size()) row = (int)lines.size() - 1;
-        int maxc = (int)lines[row].size();
+        const std::string& line = lines[row];
+        int maxc = static_cast<int>(line.size());
+        col = static_cast<int>(utf8::clampBoundary(
+            line, static_cast<std::size_t>(std::max(0, col))));
         if (mode == ChatMode::Insert) {
             if (col < 0) col = 0;
             if (col > maxc) col = maxc;
         } else {
             if (col < 0) col = 0;
-            if (col > std::max(0, maxc - 1)) col = std::max(0, maxc - 1);
+            if (maxc == 0) {
+                col = 0;
+            } else if (col >= maxc) {
+                col = static_cast<int>(utf8::previousBoundary(line, line.size()));
+            }
         }
     }
+
+    int displayColumn() const {
+        return utf8::displayWidth(
+            std::string_view(lines[row]).substr(0, static_cast<std::size_t>(col)));
+    }
+
+    void resetPreferredColumn() { preferred_column = -1; }
 
     void insertString(const std::string& s) {
         lines[row].insert(col, s);
         col += (int)s.size();
+        col = static_cast<int>(utf8::clampBoundary(lines[row], col));
+        resetPreferredColumn();
     }
 
     void insertNewline() {
@@ -1268,22 +1480,32 @@ struct VimEditor {
         lines.insert(lines.begin() + row + 1, rest);
         ++row;
         col = 0;
+        resetPreferredColumn();
     }
 
     void backspace() {
         if (col > 0) {
-            lines[row].erase(col - 1, 1);
-            --col;
+            const std::size_t previous =
+                utf8::previousBoundary(lines[row], static_cast<std::size_t>(col));
+            lines[row].erase(previous, static_cast<std::size_t>(col) - previous);
+            col = static_cast<int>(previous);
         } else if (row > 0) {
             col = (int)lines[row - 1].size();
             lines[row - 1] += lines[row];
             lines.erase(lines.begin() + row);
             --row;
         }
+        resetPreferredColumn();
     }
 
     void deleteCharUnder() {
-        if (col < (int)lines[row].size()) lines[row].erase(col, 1);
+        if (col < (int)lines[row].size()) {
+            const std::size_t next =
+                utf8::nextBoundary(lines[row], static_cast<std::size_t>(col));
+            lines[row].erase(static_cast<std::size_t>(col),
+                             next - static_cast<std::size_t>(col));
+        }
+        resetPreferredColumn();
         clampCursor();
     }
 
@@ -1292,6 +1514,7 @@ struct VimEditor {
         if (lines.empty()) lines.push_back("");
         if (row >= (int)lines.size()) row = (int)lines.size() - 1;
         col = 0;
+        resetPreferredColumn();
     }
 
     void yankLine(VimClipboard& clipboard) {
@@ -1314,6 +1537,7 @@ struct VimEditor {
                            (clipboard.lines.size() == 1 ? " LINE] "
                                                         : " LINES] ");
         clampCursor();
+        resetPreferredColumn();
     }
 
     void openLineBelow() {
@@ -1321,42 +1545,69 @@ struct VimEditor {
         ++row;
         col = 0;
         mode = ChatMode::Insert;
+        resetPreferredColumn();
     }
 
     void openLineAbove() {
         lines.insert(lines.begin() + row, "");
         col = 0;
         mode = ChatMode::Insert;
+        resetPreferredColumn();
     }
 
-    void moveLeft()  { if (col > 0) --col; }
-    void moveRight() {
-        int limit = (int)lines[row].size();
-        if (mode == ChatMode::Normal && limit > 0) limit -= 1;
-        if (col < limit) ++col;
+    void moveLeft() {
+        if (col > 0) {
+            col = static_cast<int>(utf8::previousBoundary(
+                lines[row], static_cast<std::size_t>(col)));
+        }
+        resetPreferredColumn();
     }
-    void moveUp()   { if (row > 0) { --row; clampCursor(); } }
-    void moveDown() { if (row + 1 < (int)lines.size()) { ++row; clampCursor(); } }
-    void lineStart() { col = 0; }
+    void moveRight() {
+        const std::size_t next =
+            utf8::nextBoundary(lines[row], static_cast<std::size_t>(col));
+        if (mode == ChatMode::Insert || next < lines[row].size()) {
+            col = static_cast<int>(next);
+        }
+        resetPreferredColumn();
+    }
+    void moveVertical(int direction) {
+        if (preferred_column < 0) preferred_column = displayColumn();
+        const int next_row = row + direction;
+        if (next_row < 0 || next_row >= static_cast<int>(lines.size())) return;
+        row = next_row;
+        col = static_cast<int>(
+            utf8::byteOffsetForColumn(lines[row], preferred_column));
+        clampCursor();
+    }
+    void moveUp() { moveVertical(-1); }
+    void moveDown() { moveVertical(1); }
+    void lineStart() { col = 0; resetPreferredColumn(); }
     void lineEnd() {
         col = (int)lines[row].size();
-        if (mode == ChatMode::Normal && col > 0) --col;
+        if (mode == ChatMode::Normal && col > 0) {
+            col = static_cast<int>(utf8::previousBoundary(lines[row], col));
+        }
+        resetPreferredColumn();
     }
-    void firstLine() { row = 0; col = 0; clampCursor(); }
-    void lastLine()  { row = (int)lines.size() - 1; col = 0; clampCursor(); }
-
-    static bool isWordChar(char c) {
-        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-    }
+    void firstLine() { row = 0; col = 0; resetPreferredColumn(); clampCursor(); }
+    void lastLine()  { row = (int)lines.size() - 1; col = 0; resetPreferredColumn(); clampCursor(); }
 
     void wordForward() {
         const std::string& l = lines[row];
-        int n = (int)l.size();
-        int c = col;
-        while (c < n && isWordChar(l[c])) ++c;
-        while (c < n && !isWordChar(l[c])) ++c;
-        if (c >= n && row + 1 < (int)lines.size()) { ++row; col = 0; }
-        else col = c;
+        std::size_t cursor = static_cast<std::size_t>(col);
+        while (cursor < l.size() && utf8::isWordAt(l, cursor)) {
+            cursor = utf8::nextBoundary(l, cursor);
+        }
+        while (cursor < l.size() && !utf8::isWordAt(l, cursor)) {
+            cursor = utf8::nextBoundary(l, cursor);
+        }
+        if (cursor >= l.size() && row + 1 < (int)lines.size()) {
+            ++row;
+            col = 0;
+        } else {
+            col = static_cast<int>(cursor);
+        }
+        resetPreferredColumn();
         clampCursor();
     }
 
@@ -1367,10 +1618,17 @@ struct VimEditor {
             return;
         }
         const std::string& l = lines[row];
-        int c = col - 1;
-        while (c > 0 && !isWordChar(l[c])) --c;
-        while (c > 0 && isWordChar(l[c - 1])) --c;
-        col = c;
+        std::size_t cursor = utf8::previousBoundary(l, col);
+        while (cursor > 0 && !utf8::isWordAt(l, cursor)) {
+            cursor = utf8::previousBoundary(l, cursor);
+        }
+        while (cursor > 0) {
+            const std::size_t previous = utf8::previousBoundary(l, cursor);
+            if (!utf8::isWordAt(l, previous)) break;
+            cursor = previous;
+        }
+        col = static_cast<int>(cursor);
+        resetPreferredColumn();
         clampCursor();
     }
 };
@@ -1467,7 +1725,11 @@ bool handleVimEditorEvent(VimEditor& editor, VimClipboard& clipboard,
     }
     if (event == Event::Character("a")) {
         editor.mode = ChatMode::Insert;
-        if (editor.col < (int)editor.lines[editor.row].size()) ++editor.col;
+        if (editor.col < (int)editor.lines[editor.row].size()) {
+            editor.col = static_cast<int>(utf8::nextBoundary(
+                editor.lines[editor.row], editor.col));
+        }
+        editor.resetPreferredColumn();
         editor.clampCursor();
         return true;
     }
@@ -1497,7 +1759,7 @@ bool handleVimEditorEvent(VimEditor& editor, VimClipboard& clipboard,
 }
 
 Element renderEditor(const VimEditor& ed, const Palette& pal,
-                     bool minimized = false) {
+                      bool minimized = false) {
     int total = (int)ed.lines.size();
     int width_digits = 2;
     for (int n = total; n >= 100; n /= 10) ++width_digits;
@@ -1518,13 +1780,30 @@ Element renderEditor(const VimEditor& ed, const Palette& pal,
         Element content;
         if (current) {
             bool past_end = ed.col >= (int)line.size();
-            std::string left  = past_end ? line : line.substr(0, ed.col);
-            std::string under = past_end ? " "  : line.substr(ed.col, 1);
-            std::string right = past_end ? ""   : line.substr(ed.col + 1);
+            const std::size_t cursor = static_cast<std::size_t>(ed.col);
+            const std::size_t next =
+                past_end ? cursor : utf8::nextBoundary(line, cursor);
+            constexpr int kEditorColumns = 88;
+            const int cursor_column = ed.displayColumn();
+            const int viewport_start =
+                std::max(0, cursor_column - kEditorColumns + 4);
+            const std::size_t start =
+                utf8::byteOffsetForColumn(line, viewport_start);
+            std::string left = line.substr(start, cursor - start);
+            std::string under = past_end ? " " : line.substr(cursor, next - cursor);
+            std::string right = past_end
+                                    ? ""
+                                    : utf8::sliceColumns(
+                                          std::string_view(line).substr(next),
+                                          0, kEditorColumns);
+            if (start > 0) left = "<" + left;
             auto cursor_cell = text(under) | inverted | color(cursor_color);
             content = hbox({text(left), cursor_cell, text(right), filler()});
         } else {
-            content = hbox({text(line.empty() ? " " : line), filler()});
+            content = hbox({text(line.empty()
+                                     ? " "
+                                     : utf8::truncateColumns(line, 88)),
+                            filler()});
         }
         return hbox({gutter, content});
     };
@@ -1694,14 +1973,24 @@ ConfigFileEditorPanel makeConfigFileEditorPanel(
 void runChatScreen(Config& cfg, const fs::path& workspace,
                    const fs::path& agent_config_dir,
                    const TechniquePluginRegistry& plugins) {
-    AgentContext ctx{cfg, loadAgentMd(agent_config_dir), workspace, &plugins};
+    std::error_code workspace_error;
+    const fs::path workspace_root = fs::weakly_canonical(workspace,
+                                                          workspace_error);
+    const fs::path& stable_workspace = workspace_error ? workspace
+                                                        : workspace_root;
+    AgentContext ctx{cfg, loadAgentMd(agent_config_dir), stable_workspace,
+                     &plugins};
+    const int workspace_fd = ::open(stable_workspace.c_str(),
+                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ctx.workspace_fd = workspace_fd;
     std::vector<Message> messages;
 
-    std::mutex mu;
-    std::vector<TranscriptEntry> transcript;
+    TranscriptStore transcript;
+    TranscriptView transcript_view;
     std::atomic<bool> busy{false};
-    std::atomic<bool> stop_requested{false};
-    std::thread worker;
+    std::atomic<bool> closing{false};
+    std::atomic<std::int64_t> custom_event_started_ns{0};
+    std::jthread worker;
 
     VimEditor editor;
     VimClipboard clipboard;
@@ -1714,47 +2003,28 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     // is focused the output auto-follows the latest entry (pinned to bottom).
     enum class FocusTarget { Input, Output };
     FocusTarget focus_target = FocusTarget::Input;
-    // Relative scroll position of the output frame, 0 = top, 1 = bottom.
-    float output_scroll = 1.f;
-    constexpr float kScrollStep = 0.05f;
+    // Output scrolling is tracked in logical formatted rows. This keeps j/k
+    // steps stable as the transcript grows and lets rendering construct only
+    // the visible range instead of a full-document DOM.
+    std::size_t output_top_row = 0;
+    std::size_t output_view_height = 1;
     // Ctrl+W = byte 0x17 (W is the 23rd letter). FTXUI has no Ctrl+letter
     // named constants, so build it from the raw control byte.
     const Event kCtrlW = Event::Special({23});
 
-    // Cap transcript memory + per-frame render cost.
-    constexpr size_t kTranscriptHardCap = 1000;
-    constexpr size_t kTranscriptKeep    = 900;
-    auto pushEntryLocked = [&](TranscriptEntry e) {
-        transcript.push_back(std::move(e));
-        if (transcript.size() > kTranscriptHardCap) {
-            size_t drop = transcript.size() - kTranscriptKeep;
-            transcript.erase(transcript.begin(),
-                             transcript.begin() + drop);
-            transcript.insert(
-                transcript.begin(),
-                TranscriptEntry{TranscriptEntry::Kind::System, "elided",
-                                std::string("(") + std::to_string(drop) +
-                                    " earlier entries dropped to keep the "
-                                    "transcript bounded)"});
-        }
-    };
-
-    {
-        std::lock_guard<std::mutex> lk(mu);
-        pushEntryLocked({TranscriptEntry::Kind::System, "welcome",
-                          std::string("Workspace: ") + workspace.string() +
-                               "  ·  Provider: " + providerLabel(cfg.provider) +
-                               "  ·  Model: " + selectedModel(cfg) +
-                               "  ·  Effort: " +
-                               reasoningEffortLabel(effectiveReasoningEffort(
-                                   cfg.provider, selectedModel(cfg),
-                                   cfg.reasoning_effort)) +
-                              "  ·  Technique: " +
-                              selectedTechniqueLabel(cfg, plugins)});
-        for (const auto& error : plugins.errors()) {
-            pushEntryLocked(
-                {TranscriptEntry::Kind::Error, "plugin loader", error});
-        }
+    transcript.push({TranscriptEntry::Kind::System, "welcome",
+                     std::string("Workspace: ") + stable_workspace.string() +
+                         "  ·  Provider: " + providerLabel(cfg.provider) +
+                         "  ·  Model: " + selectedModel(cfg) +
+                         "  ·  Effort: " +
+                         reasoningEffortLabel(effectiveReasoningEffort(
+                             cfg.provider, selectedModel(cfg),
+                             cfg.reasoning_effort)) +
+                         "  ·  Technique: " +
+                         selectedTechniqueLabel(cfg, plugins)});
+    for (const auto& error : plugins.errors()) {
+        transcript.push(
+            {TranscriptEntry::Kind::Error, "plugin loader", error});
     }
 
     auto screen = ScreenInteractive::Fullscreen();
@@ -1765,7 +2035,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     // toggles the overlay; `settings_mode` is the panel's own NORMAL/INSERT
     // state, surfaced in its footer.
     bool settings_open = false;
-    bool file_editor_open = false;
+    int active_view = 0;  // chat/settings or exclusive file editor
     ChatMode settings_mode = ChatMode::Normal;
     Provider provider_before_settings = cfg.provider;
     std::string model_before_settings = selectedModel(cfg);
@@ -1787,8 +2057,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                     providerAccount(cfg, cfg.provider).api_key ||
                 effort_before_settings != cfg.reasoning_effort;
             if (account_changed) messages.clear();
-            std::lock_guard<std::mutex> lk(mu);
-            pushEntryLocked(
+            transcript.push(
                 {TranscriptEntry::Kind::System, "settings",
                   std::string("Now using ") + providerLabel(cfg.provider) +
                       " / " + selectedModel(cfg) + " / " +
@@ -1803,10 +2072,9 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         }
     };
     auto close_file_editor = [&](bool saved, const fs::path& path) {
-        file_editor_open = false;
+        active_view = 0;
         if (saved) {
-            std::lock_guard<std::mutex> lk(mu);
-            pushEntryLocked(
+            transcript.push(
                 {TranscriptEntry::Kind::System, "configuration",
                  "Saved " + path.string() +
                      "; changes apply to the next turn."});
@@ -1818,37 +2086,85 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         cfg, screen, settings_mode, close_settings,
         [&] {
             file_editor.open(agent_config_dir / "tools.md");
-            file_editor_open = true;
+            active_view = 1;
         },
         [&] {
             file_editor.open(agent_config_dir / "skills.md");
-            file_editor_open = true;
+            active_view = 1;
         }, plugins);
 
     auto send_turn = [&](std::string prompt) {
         if (busy.exchange(true)) return;
-        if (worker.joinable()) worker.join();
+        if (worker.joinable()) {
+            metrics::ScopedTimer join_timer(
+                metrics::Distribution::TuiWorkerJoinUs);
+            worker.join();
+        }
         ctx.config = cfg;
         ctx.md = loadAgentMd(agent_config_dir);
-        worker = std::thread([&, prompt = std::move(prompt)]() mutable {
-            runTurn(ctx, messages, prompt,
-                    [&](const TranscriptEntry& e) {
-                        {
-                            std::lock_guard<std::mutex> lk(mu);
-                            pushEntryLocked(e);
-                        }
-                        screen.PostEvent(Event::Custom);
-                        return !stop_requested.load();
-                    });
-            {
-                std::lock_guard<std::mutex> lk(mu);
-                if (!stop_requested.load())
-                    pushEntryLocked({TranscriptEntry::Kind::System, "done",
+        worker = std::jthread(
+            [&, prompt = std::move(prompt)](std::stop_token stop) mutable {
+                TurnOutcome outcome = TurnOutcome::Failed;
+                try {
+                    outcome = runTurn(
+                        ctx, messages, prompt,
+                        [&](const TranscriptEntry& entry) {
+                            if (stop.stop_requested() || closing.load()) {
+                                return false;
+                            }
+                            transcript.push(entry);
+                            if (!closing.load()) {
+                                const auto now_ns =
+                                    std::chrono::duration_cast<
+                                        std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now()
+                                            .time_since_epoch())
+                                        .count();
+                                std::int64_t expected = 0;
+                                custom_event_started_ns.compare_exchange_strong(
+                                    expected, now_ns);
+                                metrics::add(metrics::Counter::TuiCustomEvents);
+                                screen.PostEvent(Event::Custom);
+                            }
+                            return true;
+                        },
+                        stop);
+                } catch (const std::exception& error) {
+                    if (!closing.load()) {
+                        transcript.push({TranscriptEntry::Kind::Error,
+                                         "Turn failed", error.what()});
+                    }
+                    outcome = TurnOutcome::Failed;
+                } catch (...) {
+                    if (!closing.load()) {
+                        transcript.push({TranscriptEntry::Kind::Error,
+                                         "Turn failed",
+                                         "Unexpected worker exception."});
+                    }
+                    outcome = TurnOutcome::Failed;
+                }
+                if (!closing.load() && outcome == TurnOutcome::Completed) {
+                    transcript.push({TranscriptEntry::Kind::System, "done",
                                      "Turn complete."});
+                } else if (!closing.load() &&
+                           outcome == TurnOutcome::Cancelled) {
+                    transcript.push({TranscriptEntry::Kind::System, "cancelled",
+                                     "Turn cancelled."});
+                }
+                busy.store(false);
+                if (!closing.load()) {
+                    const auto now_ns =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+                    std::int64_t expected = 0;
+                    custom_event_started_ns.compare_exchange_strong(expected,
+                                                                    now_ns);
+                    metrics::add(metrics::Counter::TuiCustomEvents);
+                    screen.PostEvent(Event::Custom);
+                }
             }
-            busy.store(false);
-            screen.PostEvent(Event::Custom);
-        });
+        );
     };
 
     auto cycle_technique = [&] {
@@ -1858,16 +2174,14 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                                      : cfg.technique_id;
         int idx = indexOfTechniqueId(ids, current);
         selectTechnique(cfg, ids[(idx + 1) % ids.size()]);
-        std::lock_guard<std::mutex> lk(mu);
-        pushEntryLocked(
+        transcript.push(
             {TranscriptEntry::Kind::System, "technique",
              std::string("Switched to ") +
                  selectedTechniqueLabel(cfg, plugins)});
     };
     auto open_settings = [&] {
         if (busy.load()) {
-            std::lock_guard<std::mutex> lk(mu);
-            pushEntryLocked(
+            transcript.push(
                 {TranscriptEntry::Kind::System, "settings",
                  "Cannot open settings while a turn is in progress."});
             return;
@@ -1881,8 +2195,8 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         settings_open = true;
     };
     auto clear_transcript = [&] {
-        std::lock_guard<std::mutex> lk(mu);
         transcript.clear();
+        output_top_row = 0;
     };
 
     auto submit_buffer = [&] {
@@ -1891,6 +2205,11 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         editor.clearBuffer();
         editor.mode = ChatMode::Insert;
         send_turn(p);
+    };
+    auto request_exit = [&] {
+        closing.store(true);
+        if (worker.joinable()) worker.request_stop();
+        screen.ExitLoopClosure()();
     };
 
     // The hidden Input only exists to claim focus so events reach our
@@ -1917,17 +2236,33 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                 return true;
             }
             if (e == Event::Character("j") || e == Event::ArrowDown) {
-                output_scroll = std::min(1.f, output_scroll + kScrollStep);
+                ++output_top_row;
                 return true;
             }
             if (e == Event::Character("k") || e == Event::ArrowUp) {
-                output_scroll = std::max(0.f, output_scroll - kScrollStep);
+                if (output_top_row > 0) --output_top_row;
                 return true;
             }
-            if (e == Event::Character("g")) { output_scroll = 0.f; return true; }
-            if (e == Event::Character("G")) { output_scroll = 1.f; return true; }
+            if (e == Event::PageDown) {
+                output_top_row += std::max<std::size_t>(1,
+                    output_view_height > 2 ? output_view_height - 2 : 1);
+                return true;
+            }
+            if (e == Event::PageUp) {
+                const std::size_t step = std::max<std::size_t>(
+                    1, output_view_height > 2 ? output_view_height - 2 : 1);
+                output_top_row = output_top_row > step
+                                     ? output_top_row - step
+                                     : 0;
+                return true;
+            }
+            if (e == Event::Character("g")) { output_top_row = 0; return true; }
+            if (e == Event::Character("G")) {
+                output_top_row = transcript_view.totalRows();
+                return true;
+            }
             if (e == Event::Character("q")) {
-                screen.ExitLoopClosure()();
+                request_exit();
                 return true;
             }
             if (e == Event::Character("s")) { open_settings();   return true; }
@@ -1955,7 +2290,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
 
         // App commands (override the vim equivalents we don't implement)
         if (e == Event::Character("q")) {
-            screen.ExitLoopClosure()();
+            request_exit();
             return true;
         }
         if (e == Event::Character("s")) { open_settings();    return true; }
@@ -1970,7 +2305,26 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
 
     auto root = Container::Vertical({editor_events});
 
+    TranscriptSnapshot transcript_snapshot;
+    std::uint64_t rendered_generation = 0;
+    Box output_box;
     auto renderer = Renderer(root, [&] {
+        const std::int64_t event_started_ns =
+            custom_event_started_ns.exchange(0);
+        if (event_started_ns > 0) {
+            const auto now_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            metrics::observe(metrics::Distribution::TuiCustomEventToRenderUs,
+                             static_cast<std::uint64_t>(
+                                 std::max<std::int64_t>(
+                                     0, now_ns - event_started_ns) /
+                                 1000));
+        }
+        metrics::ScopedTimer render_timer(
+            metrics::Distribution::TuiRenderBuildUs);
+        metrics::add(metrics::Counter::TuiRenderBuilds);
         const Palette& pal = palette(cfg.theme);
 
         // The chat editor paints its own block cursor (an `inverted` cell), and
@@ -1984,24 +2338,38 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         // focusCursor node exists in this tree to override it, so it stays gone.
         screen.SetCursor(Screen::Cursor{0, 0, Screen::Cursor::Hidden});
 
+        if (auto snapshot =
+                transcript.snapshotIfChanged(rendered_generation)) {
+            transcript_snapshot = std::move(*snapshot);
+            rendered_generation = transcript_snapshot.generation;
+        }
+        const int transcript_width = std::max(8, screen.dimx() - 6);
+        transcript_view.update(transcript_snapshot, transcript_width);
+        const int measured_height = output_box.y_max >= output_box.y_min
+                                        ? output_box.y_max - output_box.y_min + 1
+                                        : 0;
+        const int reserved_rows = input_minimized ? 7 : 13;
+        output_view_height = static_cast<std::size_t>(std::max(
+            1, measured_height > 0 ? measured_height - 2
+                                   : screen.dimy() - reserved_rows));
+        bool output_focused = (focus_target == FocusTarget::Output);
+        const std::size_t max_top = transcript_view.totalRows() >
+                                            output_view_height
+                                        ? transcript_view.totalRows() -
+                                              output_view_height
+                                        : 0;
+        if (!output_focused) output_top_row = max_top;
+        output_top_row = std::min(output_top_row, max_top);
+
         std::vector<Element> rendered;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            rendered.reserve(transcript.size());
-            for (const auto& e : transcript)
-                rendered.push_back(renderEntry(pal, e));
+        const auto visible = transcript_view.visibleRows(
+            output_top_row, output_view_height, 0);
+        rendered.reserve(visible.size());
+        for (const auto& row : visible) {
+            rendered.push_back(renderTranscriptRow(pal, row));
         }
         if (rendered.empty()) rendered.push_back(text(""));
-        bool output_focused = (focus_target == FocusTarget::Output);
-        // While the input panel is focused the output auto-follows the latest
-        // entry (pinned to the bottom). When the output panel is focused the
-        // user drives the scroll position with j/k. The focusPositionRelative
-        // must sit *inside* the frame — `| yframe` applied last would wrap the
-        // frame instead, leaving it with no focused child to scroll to (it
-        // would stay stuck at the top).
-        float scroll_y = output_focused ? output_scroll : 1.f;
-        Element scroll =
-            vbox(rendered) | focusPositionRelative(0.f, scroll_y) | yframe;
+        Element scroll = vbox(std::move(rendered));
 
         std::string status = busy.load() ? " thinking… " : " ready ";
         Color status_color = busy.load() ? pal.busy : pal.ready;
@@ -2009,21 +2377,19 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         std::string mode_tag = insert ? " -- INSERT -- " : " -- NORMAL -- ";
         Color mode_color = insert ? pal.insert_mode : pal.normal_mode;
 
+        const std::string header_summary =
+            providerLabel(cfg.provider) + " · " + selectedModel(cfg) + " · " +
+            reasoningEffortLabel(effectiveReasoningEffort(
+                cfg.provider, selectedModel(cfg), cfg.reasoning_effort)) +
+            " effort · " + selectedTechniqueLabel(cfg, plugins);
+        const int header_summary_width = std::max(8, screen.dimx() - 38);
         Element header_content =
             hbox({
                 text("OVI-CODE") | bold | color(pal.accent),
                 text("  "),
-                text(providerLabel(cfg.provider)) | color(pal.muted),
-                text(" · "),
-                text(selectedModel(cfg)) | color(pal.muted),
-                text(" · "),
-                text(reasoningEffortLabel(effectiveReasoningEffort(
-                         cfg.provider, selectedModel(cfg),
-                         cfg.reasoning_effort)) + " effort") |
+                text(utf8::truncateColumns(header_summary,
+                                           header_summary_width)) |
                     color(pal.muted),
-                text(" · "),
-                text(selectedTechniqueLabel(cfg, plugins)) |
-                    color(pal.technique),
                 filler(),
                 text(mode_tag) | color(mode_color) | bold,
                 text(" "),
@@ -2042,8 +2408,9 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                         text(output_focused ? "[SCROLL · j/k]" : "") |
                             color(pal.normal_mode),
                     }),
-                   std::move(scroll) | color(pal.foreground)) |
-            color(output_focused ? pal.accent : pal.border) | flex;
+                    std::move(scroll) | color(pal.foreground)) |
+            color(output_focused ? pal.accent : pal.border) |
+            reflect(output_box) | flex;
 
         Element input_body = input_minimized
             ? renderEditor(editor, pal, true)
@@ -2086,17 +2453,27 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                      flex);
     });
 
-    // Keep every overlay in this screen. The file editor is layered above
-    // Settings so closing it returns to the same configuration form.
+    // Keep one ScreenInteractive. Settings remain a chat overlay; the file
+    // editor is an exclusive tab so editing never rebuilds the chat transcript
+    // or settings underneath it.
     auto settings_app = Modal(renderer, settings.component, &settings_open);
-    auto app = Modal(settings_app, file_editor.component, &file_editor_open);
+    auto app = Container::Tab({settings_app, file_editor.component},
+                              &active_view);
 
     screen.Loop(app);
+    const auto shutdown_started = std::chrono::steady_clock::now();
+    closing.store(true);
     if (worker.joinable()) {
-        stop_requested.store(true);
+        worker.request_stop();
+        metrics::ScopedTimer join_timer(metrics::Distribution::TuiWorkerJoinUs);
         worker.join();
-        stop_requested.store(false);
     }
+    metrics::observe(
+        metrics::Distribution::TuiShutdownUs,
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - shutdown_started)
+            .count());
+    if (workspace_fd >= 0) ::close(workspace_fd);
 }
 
 }  // namespace ovicode

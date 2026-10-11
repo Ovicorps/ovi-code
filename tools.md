@@ -22,3 +22,11 @@ constrain or extend the built-in tools.
 - To create a new file, pass `old_str = ""` and the full contents as
   `new_str`.
 - Make one logical change per `edit_file` call.
+
+
+## edit_all
+
+- Same as `edit_file` with the added ability to do CRUD operations at a system level with system level permissions.
+- Allways ask the user if it allow the system level permission before doing any CRUD operation. 
+- CRUD operations are define as Create, Read, Update, Delete operation and there translation as necessary to bash, shell, etc 
+- Only do the CRUD operations inside the project folder/directory 

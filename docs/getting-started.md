@@ -35,6 +35,10 @@ Building from source additionally requires:
     cmake --install build --prefix ~/.local
     ```
 
+    The install includes the Deliberate example technique plugin under the
+    selected prefix. Build-tree runs discover the same plugin in
+    `build/plugins` automatically.
+
 ## Configure
 
 Run the application:
@@ -50,6 +54,10 @@ The first launch opens a five-step setup wizard:
 3. Choose a curated model or enter a custom provider model ID.
 4. Choose a reasoning effort supported by that model.
 5. Choose the default agentic technique.
+
+OVI-CODE includes the **Deliberate** example plugin and preselects it for a
+fresh configuration. It demonstrates configurable plugins with options under
+**Settings → Plugins**. Choose another technique during setup if preferred.
 
 Configuration is stored at `~/.ovi-code/config.json` with permissions set to
 `0600`. To rerun setup later:

@@ -74,6 +74,10 @@ std::string extractApiError(const std::string& body) {
 
 ChatResponse transportError(const http::Response& response) {
     ChatResponse out;
+    if (response.cancelled) {
+        out.cancelled = true;
+        return out;
+    }
     out.error = "Network error: " +
                 (response.error.empty() ? std::string("unknown")
                                         : response.error);
@@ -88,7 +92,7 @@ ChatResponse apiError(const std::string& label,
     return out;
 }
 
-json toolsAsOpenAI(const std::vector<ToolDefinition>& tools) {
+json toolsAsOpenAI(std::span<const ToolDefinition> tools) {
     json result = json::array();
     for (const auto& tool : tools) {
         result.push_back({
@@ -103,7 +107,7 @@ json toolsAsOpenAI(const std::vector<ToolDefinition>& tools) {
     return result;
 }
 
-json toolsAsAnthropic(const std::vector<ToolDefinition>& tools) {
+json toolsAsAnthropic(std::span<const ToolDefinition> tools) {
     json result = json::array();
     for (const auto& tool : tools) {
         result.push_back({
@@ -265,7 +269,7 @@ ChatResponse parseOpenAIResponse(const std::string& label,
                     }
                 }
                 if (call.input.is_null()) call.input = json::object();
-                out.tool_calls.push_back(std::move(call));
+                if (!call.name.empty()) out.tool_calls.push_back(std::move(call));
             }
         }
     } catch (const std::exception& error) {
@@ -273,34 +277,40 @@ ChatResponse parseOpenAIResponse(const std::string& label,
         out.error = label + ": invalid response (" + error.what() + ")";
         return out;
     }
+    if (out.raw_finish_reason == "length" ||
+        out.raw_finish_reason == "content_filter") {
+        out.error = label + ": incomplete response (finish_reason=" +
+                    out.raw_finish_reason + ")";
+        return out;
+    }
+    if (out.raw_finish_reason == "tool_calls" && out.tool_calls.empty()) {
+        out.error = label + ": finish_reason=tool_calls without valid calls";
+        return out;
+    }
+    if (!out.tool_calls.empty() && out.raw_finish_reason != "tool_calls") {
+        out.error = label + ": tool calls with inconsistent finish_reason=" +
+                    out.raw_finish_reason;
+        return out;
+    }
+    if (out.tool_calls.empty() && out.raw_finish_reason != "stop") {
+        out.error = label + ": unsupported finish_reason=" +
+                    out.raw_finish_reason;
+        return out;
+    }
+    if (out.text.empty() && out.tool_calls.empty()) {
+        out.error = label + ": empty response";
+        return out;
+    }
     out.stop_requested = out.tool_calls.empty();
     return out;
 }
 
-ChatResponse callOpenAICompatible(const Config& cfg, const ChatRequest& req,
-                                  Provider provider, const std::string& url) {
-    const ProviderInfo& info = providerInfo(provider);
-    const std::string api_key =
-        normalizeApiKey(effectiveApiKey(cfg, provider));
-    if (api_key.empty()) {
-        ChatResponse out;
-        out.error = info.label + ": missing API key (set it in Settings or via " +
-                    info.environment_variable + ").";
-        return out;
-    }
-    if (provider == Provider::OpenRouter &&
-        !api_key.starts_with("sk-or-v1-")) {
-        ChatResponse out;
-        out.error = "OpenRouter: invalid API key. Use an OpenRouter key "
-                    "starting with 'sk-or-v1-'.";
-        return out;
-    }
-
+json openAIRequestBody(const Config& cfg, const ChatRequest& req,
+                       Provider provider) {
     const std::string& model = providerAccount(cfg, provider).model;
     json body = {
         {"model", model},
-        {"messages", messagesAsOpenAI(req,
-                                       provider == Provider::OpenRouter)},
+        {"messages", messagesAsOpenAI(req, provider == Provider::OpenRouter)},
         {"stream", false},
     };
     if (cfg.max_tokens > 0) {
@@ -325,29 +335,10 @@ ChatResponse callOpenAICompatible(const Config& cfg, const ChatRequest& req,
         }
     }
     if (!req.tools.empty()) body["tools"] = toolsAsOpenAI(req.tools);
-
-    std::vector<std::string> headers{
-        "Authorization: Bearer " + api_key,
-        "Content-Type: application/json",
-        "Accept: application/json",
-    };
-    if (provider == Provider::OpenRouter) headers.push_back("X-Title: OVI-CODE");
-    const auto response = http::post(url, headers, body.dump());
-    return parseOpenAIResponse(info.label, response,
-                               provider == Provider::OpenRouter);
+    return body;
 }
 
-ChatResponse callAnthropic(const Config& cfg, const ChatRequest& req) {
-    const ProviderInfo& info = providerInfo(Provider::Anthropic);
-    const std::string api_key =
-        normalizeApiKey(effectiveApiKey(cfg, Provider::Anthropic));
-    if (api_key.empty()) {
-        ChatResponse out;
-        out.error = "Anthropic: missing API key (set it in Settings or via " +
-                    info.environment_variable + ").";
-        return out;
-    }
-
+json messagesAsAnthropic(const ChatRequest& req) {
     json messages = json::array();
     for (size_t i = 0; i < req.messages.size(); ++i) {
         const auto& message = req.messages[i];
@@ -406,12 +397,15 @@ ChatResponse callAnthropic(const Config& cfg, const ChatRequest& req) {
                 break;
         }
     }
+    return messages;
+}
 
+json anthropicRequestBody(const Config& cfg, const ChatRequest& req) {
     const std::string& model = selectedModel(cfg);
     json body = {
         {"model", model},
         {"max_tokens", cfg.max_tokens > 0 ? cfg.max_tokens : 4096},
-        {"messages", std::move(messages)},
+        {"messages", messagesAsAnthropic(req)},
     };
     if (!req.system.empty()) body["system"] = req.system;
     if (!req.tools.empty()) body["tools"] = toolsAsAnthropic(req.tools);
@@ -428,6 +422,69 @@ ChatResponse callAnthropic(const Config& cfg, const ChatRequest& req) {
             {"effort", reasoningEffortToString(effort)},
         };
     }
+    return body;
+}
+
+ChatResponse requestTooLarge(const Config& cfg, std::size_t actual) {
+    ChatResponse out;
+    out.error = "Request is " + std::to_string(actual) +
+                " bytes, exceeding max_request_bytes (" +
+                std::to_string(cfg.max_request_bytes) + ").";
+    return out;
+}
+
+ChatResponse callOpenAICompatible(const Config& cfg, const ChatRequest& req,
+                                   Provider provider, const std::string& url,
+                                   std::stop_token stop) {
+    const ProviderInfo& info = providerInfo(provider);
+    const std::string api_key =
+        normalizeApiKey(effectiveApiKey(cfg, provider));
+    if (api_key.empty()) {
+        ChatResponse out;
+        out.error = info.label + ": missing API key (set it in Settings or via " +
+                    info.environment_variable + ").";
+        return out;
+    }
+    if (provider == Provider::OpenRouter &&
+        !api_key.starts_with("sk-or-v1-")) {
+        ChatResponse out;
+        out.error = "OpenRouter: invalid API key. Use an OpenRouter key "
+                    "starting with 'sk-or-v1-'.";
+        return out;
+    }
+
+    const std::string body = openAIRequestBody(cfg, req, provider).dump();
+    if (cfg.max_request_bytes > 0 && body.size() > cfg.max_request_bytes) {
+        return requestTooLarge(cfg, body.size());
+    }
+
+    std::vector<std::string> headers{
+        "Authorization: Bearer " + api_key,
+        "Content-Type: application/json",
+        "Accept: application/json",
+    };
+    if (provider == Provider::OpenRouter) headers.push_back("X-Title: OVI-CODE");
+    const auto response = http::post(url, headers, body, 120, stop);
+    return parseOpenAIResponse(info.label, response,
+                               provider == Provider::OpenRouter);
+}
+
+ChatResponse callAnthropic(const Config& cfg, const ChatRequest& req,
+                           std::stop_token stop) {
+    const ProviderInfo& info = providerInfo(Provider::Anthropic);
+    const std::string api_key =
+        normalizeApiKey(effectiveApiKey(cfg, Provider::Anthropic));
+    if (api_key.empty()) {
+        ChatResponse out;
+        out.error = "Anthropic: missing API key (set it in Settings or via " +
+                    info.environment_variable + ").";
+        return out;
+    }
+
+    const std::string body = anthropicRequestBody(cfg, req).dump();
+    if (cfg.max_request_bytes > 0 && body.size() > cfg.max_request_bytes) {
+        return requestTooLarge(cfg, body.size());
+    }
 
     const auto response = http::post(
         kAnthropicUrl,
@@ -437,7 +494,7 @@ ChatResponse callAnthropic(const Config& cfg, const ChatRequest& req) {
             "content-type: application/json",
             "accept: application/json",
         },
-        body.dump());
+        body, 120, stop);
     if (response.status == 0) return transportError(response);
     if (response.status < 200 || response.status >= 300) {
         return apiError(info.label, response);
@@ -479,7 +536,7 @@ ChatResponse callAnthropic(const Config& cfg, const ChatRequest& req) {
                 call.input = part.contains("input") && part["input"].is_object()
                                  ? part["input"]
                                  : json::object();
-                out.tool_calls.push_back(std::move(call));
+                if (!call.name.empty()) out.tool_calls.push_back(std::move(call));
             }
         }
     } catch (const std::exception& error) {
@@ -488,24 +545,65 @@ ChatResponse callAnthropic(const Config& cfg, const ChatRequest& req) {
                     ")";
         return out;
     }
+    if (out.raw_finish_reason == "max_tokens" ||
+        out.raw_finish_reason == "refusal" ||
+        out.raw_finish_reason == "pause_turn") {
+        out.error = "Anthropic: incomplete response (stop_reason=" +
+                    out.raw_finish_reason + ")";
+        return out;
+    }
+    if (out.raw_finish_reason == "tool_use" && out.tool_calls.empty()) {
+        out.error = "Anthropic: stop_reason=tool_use without valid calls";
+        return out;
+    }
+    if (!out.tool_calls.empty() && out.raw_finish_reason != "tool_use") {
+        out.error = "Anthropic: tool calls with inconsistent stop_reason=" +
+                    out.raw_finish_reason;
+        return out;
+    }
+    if (out.tool_calls.empty() && out.raw_finish_reason != "end_turn" &&
+        out.raw_finish_reason != "stop_sequence") {
+        out.error = "Anthropic: unsupported stop_reason=" +
+                    out.raw_finish_reason;
+        return out;
+    }
+    if (out.text.empty() && out.tool_calls.empty()) {
+        out.error = "Anthropic: empty response";
+        return out;
+    }
     out.stop_requested = out.tool_calls.empty();
     return out;
 }
 
 }  // namespace
 
-ChatResponse chat(const Config& cfg, const ChatRequest& req) {
+std::string serializeChatRequestBody(const Config& cfg,
+                                     const ChatRequest& req) {
+    if (cfg.provider == Provider::Anthropic) {
+        return anthropicRequestBody(cfg, req).dump();
+    }
+    return openAIRequestBody(cfg, req, cfg.provider).dump();
+}
+
+ChatResponse chat(const Config& cfg, const ChatRequest& req,
+                  std::stop_token stop) {
+    if (stop.stop_requested()) {
+        ChatResponse out;
+        out.cancelled = true;
+        return out;
+    }
     switch (cfg.provider) {
         case Provider::OpenRouter:
             return callOpenAICompatible(cfg, req, Provider::OpenRouter,
-                                        kOpenRouterUrl);
+                                         kOpenRouterUrl, stop);
         case Provider::OpenAI:
             return callOpenAICompatible(cfg, req, Provider::OpenAI,
-                                        kOpenAIUrl);
+                                         kOpenAIUrl, stop);
         case Provider::Anthropic:
-            return callAnthropic(cfg, req);
+            return callAnthropic(cfg, req, stop);
         case Provider::XAI:
-            return callOpenAICompatible(cfg, req, Provider::XAI, kXAIUrl);
+            return callOpenAICompatible(cfg, req, Provider::XAI, kXAIUrl,
+                                        stop);
     }
     ChatResponse out;
     out.error = "Unknown provider.";

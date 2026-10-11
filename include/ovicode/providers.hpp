@@ -1,6 +1,9 @@
 #pragma once
 
+#include <span>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -23,9 +26,9 @@ struct Message {
 };
 
 struct ChatRequest {
-    std::string system;
-    std::vector<Message> messages;
-    std::vector<ToolDefinition> tools;
+    std::string_view system;
+    std::span<const Message> messages;
+    std::span<const ToolDefinition> tools;
 };
 
 struct ChatResponse {
@@ -33,10 +36,14 @@ struct ChatResponse {
     std::vector<ToolCall> tool_calls;
     nlohmann::json reasoning_details;
     bool stop_requested = false;   // model finished without tool calls
+    bool cancelled = false;
     std::string error;             // non-empty on transport / API error
     std::string raw_finish_reason;
 };
 
-ChatResponse chat(const Config& cfg, const ChatRequest& req);
+ChatResponse chat(const Config& cfg, const ChatRequest& req,
+                  std::stop_token stop = {});
+std::string serializeChatRequestBody(const Config& cfg,
+                                     const ChatRequest& req);
 
 }  // namespace ovicode

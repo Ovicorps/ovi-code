@@ -9,6 +9,11 @@ workspace tools. Choose one in Settings or press ++t++ from chat Normal mode.
 | **Chain of Thought** | Adds a step-by-step reasoning instruction before the ReAct loop | Multi-step diagnosis and planning |
 | **Ralph Loop** | Reissues the same goal for a configured number of passes and stops early on `DONE` | Iterative refactors and repeated improvement |
 | **RAG** | Searches the workspace for query keywords and prepends matching excerpts | Large or unfamiliar projects |
+| **Deliberate [plugin]** | States and updates hypotheses while explicitly verifying changes | Demonstrating the bundled plugin system and verification-focused work |
+
+Deliberate is bundled, loaded automatically, and selected for fresh
+configurations. Existing users retain their saved technique. Configure its
+behavior under **Settings → Plugins**.
 
 ## Execution limits
 
@@ -34,7 +39,8 @@ the local curated list.
 
 ## Choosing a technique
 
-- Start with **Standard ReAct** for normal implementation and debugging.
+- Start with the bundled **Deliberate** plugin to see plugin configuration and
+  explicit verification in action, or use **Standard ReAct** for a plain loop.
 - Use **Chain of Thought** when a task benefits from explicit decomposition.
 - Use **Ralph Loop** when the model should inspect and improve its result over
   several passes.

@@ -2,13 +2,20 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #include "ovicode/agent_md.hpp"
 #include "ovicode/config.hpp"
+#include "ovicode/metrics.hpp"
 #include "ovicode/plugins.hpp"
 #include "ovicode/tui.hpp"
 
@@ -89,8 +96,8 @@ void printHelp() {
         "                             skills.md from (default: workspace)\n"
         "  --config <file>            Path to ovi-code config.json\n"
         "                             (default: ~/.ovi-code/config.json)\n"
-        "  --plugin-dir <dir>         Runtime C++ technique plugins\n"
-        "                             (default: ~/.ovi-code/plugins)\n"
+        "  --plugin-dir <dir>         Use only this plugin directory\n"
+        "                             (default: bundled + ~/.ovi-code/plugins)\n"
         "  --setup                    Force the setup wizard to run\n"
         "  --init                     Alias for the init command\n"
         "  --list-plugins             Alias for the plugins command\n"
@@ -103,7 +110,7 @@ void printHelp() {
         "  OPENAI_API_KEY             Overrides the saved OpenAI API key.\n"
         "  ANTHROPIC_API_KEY          Overrides the saved Anthropic API key.\n"
         "  XAI_API_KEY                Overrides the saved xAI/Grok API key.\n"
-        "  OVI_CODE_PLUGIN_DIR        Overrides the technique plugin directory.\n"
+        "  OVI_CODE_PLUGIN_DIR        Use only this plugin directory.\n"
         "\n"
         "Keyboard shortcuts:\n"
         "  Insert mode                Type; Enter adds a line; Esc enters Normal mode\n"
@@ -173,13 +180,62 @@ Args parseArgs(int argc, char** argv) {
     }
     if (a.agent_config_dir.empty()) a.agent_config_dir = a.workspace;
     if (a.plugin_dir.empty()) {
-        if (const char* env = std::getenv("OVI_CODE_PLUGIN_DIR"); env && *env) {
+        if (const char* env = std::getenv("OVI_CODE_PLUGIN_DIR"); env && *env)
             a.plugin_dir = env;
-        } else {
-            a.plugin_dir = ovicode::defaultConfigDir() / "plugins";
-        }
     }
     return a;
+}
+
+fs::path executablePath(const char* argv0) {
+    fs::path result;
+#if defined(__APPLE__)
+    uint32_t size = 1024;
+    std::vector<char> buffer(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+        buffer.resize(size);
+        if (_NSGetExecutablePath(buffer.data(), &size) == 0)
+            result = buffer.data();
+    } else {
+        result = buffer.data();
+    }
+#elif defined(__linux__)
+    std::vector<char> buffer(1024);
+    while (true) {
+        const ssize_t length =
+            ::readlink("/proc/self/exe", buffer.data(), buffer.size());
+        if (length < 0) break;
+        if (static_cast<std::size_t>(length) < buffer.size()) {
+            result = std::string(buffer.data(), static_cast<std::size_t>(length));
+            break;
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#endif
+    if (result.empty() && argv0 && *argv0) result = argv0;
+    std::error_code ec;
+    const fs::path canonical = fs::weakly_canonical(result, ec);
+    return ec ? fs::absolute(result, ec) : canonical;
+}
+
+std::vector<fs::path> defaultPluginDirectories(const char* argv0) {
+    std::vector<fs::path> directories;
+    std::set<fs::path> seen;
+    auto add = [&](fs::path path) {
+        path = path.lexically_normal();
+        if (!path.empty() && seen.insert(path).second)
+            directories.push_back(std::move(path));
+    };
+
+    const fs::path executable = executablePath(argv0);
+    if (!executable.empty()) {
+        // Build trees and portable release archives keep plugins beside the
+        // executable. Prefix installs use <prefix>/lib/ovi-code/plugins.
+        add(executable.parent_path() / "plugins");
+        add(executable.parent_path() / ".." / "lib" / "ovi-code" /
+            "plugins");
+    }
+    add(ovicode::defaultConfigDir() / "plugins");
+    return directories;
 }
 
 int uninstallConfig(const fs::path& path) {
@@ -216,6 +272,10 @@ int uninstallConfig(const fs::path& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    struct FlushMetricsOnExit {
+        ~FlushMetricsOnExit() { ovicode::metrics::flush(); }
+    } flush_metrics_on_exit;
+    (void)flush_metrics_on_exit;
     auto args = parseArgs(argc, argv);
     if (args.show_help) {
         printHelp();
@@ -232,15 +292,32 @@ int main(int argc, char** argv) {
     std::error_code ec;
     args.workspace = fs::absolute(args.workspace, ec);
     args.agent_config_dir = fs::absolute(args.agent_config_dir, ec);
-    args.plugin_dir = fs::absolute(args.plugin_dir, ec);
+    std::vector<fs::path> plugin_directories;
+    if (!args.plugin_dir.empty()) {
+        args.plugin_dir = fs::absolute(args.plugin_dir, ec);
+        plugin_directories.push_back(args.plugin_dir);
+    } else {
+        plugin_directories = defaultPluginDirectories(argv[0]);
+    }
 
     ovicode::TechniquePluginRegistry plugins;
-    plugins.loadDirectory(args.plugin_dir);
+    for (const auto& directory : plugin_directories)
+        plugins.loadDirectory(directory);
     if (args.command == Command::Plugins) {
-        std::cout << "Technique plugin directory: " << args.plugin_dir << "\n";
+        std::cout << "Technique plugin directories:\n";
+        for (const auto& directory : plugin_directories)
+            std::cout << "  " << directory << "\n";
+        std::cout << "Loaded plugins:\n";
         for (const auto& plugin : plugins.plugins()) {
             std::cout << "  " << plugin->id << "\t" << plugin->label << " — "
-                      << plugin->description << "\n";
+                      << plugin->description;
+            if (!plugin->parameters.empty()) {
+                std::cout << " (" << plugin->parameters.size()
+                          << " setting"
+                          << (plugin->parameters.size() == 1 ? "" : "s")
+                          << ")";
+            }
+            std::cout << "\n";
         }
         if (plugins.plugins().empty()) std::cout << "  (no plugins loaded)\n";
         for (const auto& error : plugins.errors()) {
@@ -252,6 +329,12 @@ int main(int argc, char** argv) {
     ovicode::migrateLegacyConfig(args.config_path);
     auto maybe_cfg = ovicode::loadConfig(args.config_path);
     ovicode::Config cfg = maybe_cfg.value_or(ovicode::Config{});
+    if (!maybe_cfg.has_value() && plugins.find("deliberate")) {
+        // Demonstrate the bundled plugin on fresh installs. Existing users keep
+        // their persisted technique selection unchanged.
+        cfg.technique = ovicode::Technique::Standard;
+        cfg.technique_id = "deliberate";
+    }
     const bool init_only = args.command == Command::Init;
 
     if (!maybe_cfg.has_value() ||

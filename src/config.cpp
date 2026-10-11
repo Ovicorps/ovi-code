@@ -1,5 +1,6 @@
 #include "ovicode/config.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -475,7 +476,28 @@ std::optional<Config> loadConfig(const fs::path& path) {
         c.ralph_iterations = j.value("ralph_iterations", 3);
         c.plugin_iterations = j.value("plugin_iterations", 3);
         c.max_tokens = j.value("max_tokens", 4096);
+        c.max_context_bytes =
+            j.value("max_context_bytes", std::size_t{2 * 1024 * 1024});
+        c.max_request_bytes =
+            j.value("max_request_bytes", std::size_t{4 * 1024 * 1024});
+        c.max_context_bytes = std::clamp<std::size_t>(
+            c.max_context_bytes, 64 * 1024, 64 * 1024 * 1024);
+        c.max_request_bytes = std::clamp<std::size_t>(
+            c.max_request_bytes, 64 * 1024, 128 * 1024 * 1024);
         c.temperature = j.value("temperature", 0.2);
+        if (j.contains("plugin_parameters") &&
+            j["plugin_parameters"].is_object()) {
+            for (const auto& [plugin_id, values] :
+                 j["plugin_parameters"].items()) {
+                if (!values.is_object()) continue;
+                for (const auto& [key, value] : values.items()) {
+                    if (value.is_string()) {
+                        c.plugin_parameters[plugin_id][key] =
+                            value.get<std::string>();
+                    }
+                }
+            }
+        }
     } catch (...) {
         return std::nullopt;
     }
@@ -515,7 +537,10 @@ bool saveConfig(const Config& cfg, const fs::path& path) {
         {"ralph_iterations", cfg.ralph_iterations},
         {"plugin_iterations", cfg.plugin_iterations},
         {"max_tokens", cfg.max_tokens},
+        {"max_context_bytes", cfg.max_context_bytes},
+        {"max_request_bytes", cfg.max_request_bytes},
         {"temperature", cfg.temperature},
+        {"plugin_parameters", cfg.plugin_parameters},
     };
     std::ofstream f(path);
     if (!f) return false;

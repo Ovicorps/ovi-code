@@ -20,7 +20,9 @@ scripts/
 Pushing a `v*` tag runs `.github/workflows/release.yml`. It builds native
 Apple Silicon and Intel binaries, packages them as `.tar.gz` archives, records
 their SHA-256 checksums, and attaches everything to a GitHub release. The cask
-selects the matching archive with Homebrew's `on_arm` / `on_intel` blocks.
+selects the matching archive with Homebrew's `on_arm` / `on_intel` blocks. Each
+archive contains the executable and the bundled Deliberate plugin; the source
+formula installs the same plugin through CMake.
 
 The source repository and its release assets must be publicly downloadable for
 public Homebrew installs. The tap repository must also exist at

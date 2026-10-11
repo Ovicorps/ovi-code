@@ -25,7 +25,7 @@ Single-process C++20 binary. Layering, bottom-up:
 - **`tools.{hpp,cpp}`** — three workspace-sandboxed tools (`read_file`, `list_files`, `edit_file`) and their JSON Schemas. `edit_file` enforces unique-occurrence matching; empty `old_str` means "create new file". `resolveInside()` is the only path-traversal guard — every tool must route through it.
 - **`providers.{hpp,cpp}`** — provider dispatch for OpenRouter, OpenAI, Anthropic, and xAI/Grok. The internal `ChatRequest` / `ChatResponse` / `Message` types remain wire-format agnostic; this layer translates OpenAI-compatible and Anthropic-native messages and tool calls.
 - **`agent_md.{hpp,cpp}`** — loads `agent.md` / `tools.md` / `skills.md` from the workspace (or `--agent-config-dir`) and assembles the system prompt. Technique-specific prefaces are layered in here.
-- **`plugins.{hpp,cpp}` / `technique_plugin.h`** — runtime loader and versioned C ABI for user-defined C++ technique modules. Plugins are loaded from `~/.ovi-code/plugins` (or `--plugin-dir`) and drive turns through host callbacks without linking against app internals.
+- **`plugins.{hpp,cpp}` / `technique_plugin.h`** — runtime loader and versioned C ABI for user-defined C++ technique modules. The bundled Deliberate example is discovered beside the executable or under the install prefix; user plugins are also loaded from `~/.ovi-code/plugins`. `--plugin-dir` replaces this search list. Plugins drive turns through host callbacks without linking against app internals.
 - **`react.{hpp,cpp}`** — the ReAct loop. `runTurn()` is the entry point; it handles all four techniques:
   - `Standard` — straight ReAct loop capped by `max_tool_iterations`.
   - `ChainOfThought` — adds a "think step by step" preface.

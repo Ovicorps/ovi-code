@@ -48,8 +48,10 @@ ovi-code
 ```
 
 The first launch asks for a provider account, API key, model, reasoning effort,
-and default technique. Type a request in Insert mode, press ++esc++ to enter
-Normal mode, then press ++enter++ to send it.
+and default technique. The installed **Deliberate** example plugin is
+preselected for fresh configurations and can be customized under **Settings →
+Plugins**. Type a request in Insert mode, press ++esc++ to enter Normal mode,
+then press ++enter++ to send it.
 
 [Get started](getting-started.md){ .md-button .md-button--primary }
 [Learn the TUI](user-guide.md){ .md-button }
@@ -64,6 +66,7 @@ Normal mode, then press ++enter++ to send it.
 - Project instructions from `agent.md`, `tools.md`, and `skills.md`.
 - Dark, light, system, and high-contrast plain themes.
 - Native C++ technique plugins through a versioned C ABI.
+- Bundled configurable Deliberate plugin, active on fresh installations.
 
 !!! warning "Review agent changes"
     OVI-CODE can make broad changes inside the selected workspace. Use version

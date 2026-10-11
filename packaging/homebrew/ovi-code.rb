@@ -48,10 +48,11 @@ class OviCode < Formula
            "-DFETCHCONTENT_SOURCE_DIR_FTXUI=#{ftxui_src}",
            *std_cmake_args
     system "cmake", "--build", "build"
-    bin.install "build/ovi-code"
+    system "cmake", "--install", "build"
   end
 
   test do
     assert_match "OVI-CODE", shell_output("#{bin}/ovi-code --help")
+    assert_match "Deliberate", shell_output("#{bin}/ovi-code plugins")
   end
 end

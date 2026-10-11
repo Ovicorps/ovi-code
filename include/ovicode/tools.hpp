@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,8 @@ struct ToolResult {
 
 const std::vector<ToolDefinition>& builtinTools();
 
-ToolResult executeTool(const std::filesystem::path& workspace, const ToolCall& call);
+ToolResult executeTool(const std::filesystem::path& workspace,
+                       const ToolCall& call, std::stop_token stop = {},
+                       int workspace_fd = -1);
 
 }  // namespace ovicode
