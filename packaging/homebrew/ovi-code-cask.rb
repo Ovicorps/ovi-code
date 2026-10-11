@@ -15,6 +15,11 @@ cask "ovi-code" do
   desc "Terminal-based code-editing TUI agent powered by OpenRouter"
   homepage "https://github.com/Ovicorps/ovi-code"
 
+  livecheck do
+    url :homepage
+    strategy :github_latest
+  end
+
   depends_on macos: ">= :ventura"
 
   binary "ovi-code"

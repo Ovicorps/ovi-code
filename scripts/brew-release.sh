@@ -25,11 +25,15 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 template="$here/packaging/homebrew/ovi-code.rb"
 
 tag="${1:-}"
-out="${2:-$template}"
+out="${2:-$here/packaging/homebrew/Formula/ovi-code.rb}"
 
 if [[ -z "$tag" ]]; then
   echo "usage: $0 <tag> [output.rb]" >&2
   echo "       e.g. $0 v0.1.0" >&2
+  exit 2
+fi
+if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+  echo "tag must be a version starting with v (for example, v0.2.0)" >&2
   exit 2
 fi
 
@@ -49,7 +53,7 @@ echo ">> tag       : $tag"  >&2
 
 # --- read the FetchContent tags out of CMakeLists.txt ----------------------
 # Keeps json/ftxui versions in lockstep with the actual build.
-cml="$here/CMakeLists.txt"
+cml="${OVI_CODE_RELEASE_SOURCE_DIR:-$here}/CMakeLists.txt"
 json_url="$(grep -A2 'FetchContent_Declare(json' "$cml" | grep GIT_REPOSITORY | awk '{print $2}')"
 json_tag="$(grep -A3 'FetchContent_Declare(json' "$cml" | grep GIT_TAG | awk '{print $2}')"
 ftxui_url="$(grep -A2 'FetchContent_Declare(ftxui' "$cml" | grep GIT_REPOSITORY | awk '{print $2}')"
@@ -76,7 +80,9 @@ ftxui_sha="$(sha_of "$ftxui_tarball")"
 mkdir -p "$(dirname "$out")"
 sed \
   -e "s#https://github.com/Ovicorps/ovi-code#https://github.com/${slug}#g" \
-  -e "s#/v0.1.0.tar.gz#/${tag}.tar.gz#g" \
+  -e "s#REPLACE_WITH_TAG#${tag}#g" \
+  -e "s#REPLACE_WITH_JSON_URL#${json_tarball}#g" \
+  -e "s#REPLACE_WITH_FTXUI_URL#${ftxui_tarball}#g" \
   -e "s/REPLACE_WITH_SOURCE_TARBALL_SHA256/${src_sha}/" \
   -e "s/REPLACE_WITH_JSON_TARBALL_SHA256/${json_sha}/" \
   -e "s/REPLACE_WITH_FTXUI_TARBALL_SHA256/${ftxui_sha}/" \

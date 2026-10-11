@@ -78,3 +78,9 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "OVI-CODE ${GITHUB_REF_NAME}" \
             --generate-notes
+
+  homebrew:
+    needs: release
+    uses: ./.github/workflows/homebrew.yml
+    secrets:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

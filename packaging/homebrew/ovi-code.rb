@@ -11,10 +11,15 @@
 class OviCode < Formula
   desc "Tiny terminal-based code-editing TUI agent (ReAct, multi-provider)"
   homepage "https://github.com/Ovicorps/ovi-code"
-  url "https://github.com/Ovicorps/ovi-code/archive/refs/tags/v0.1.0.tar.gz"
+  url "https://github.com/Ovicorps/ovi-code/archive/refs/tags/REPLACE_WITH_TAG.tar.gz"
   sha256 "REPLACE_WITH_SOURCE_TARBALL_SHA256"
   license "MIT"
   head "https://github.com/Ovicorps/ovi-code.git", branch: "main"
+
+  livecheck do
+    url :homepage
+    strategy :github_latest
+  end
 
   depends_on "cmake" => :build
 
@@ -27,12 +32,12 @@ class OviCode < Formula
   # Pinned to the GIT_TAGs in CMakeLists.txt. Keep these in sync when the
   # FetchContent_Declare tags change.
   resource "json" do
-    url "https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz"
+    url "REPLACE_WITH_JSON_URL"
     sha256 "REPLACE_WITH_JSON_TARBALL_SHA256"
   end
 
   resource "ftxui" do
-    url "https://github.com/ArthurSonzogni/FTXUI/archive/refs/tags/v5.0.0.tar.gz"
+    url "REPLACE_WITH_FTXUI_URL"
     sha256 "REPLACE_WITH_FTXUI_TARBALL_SHA256"
   end
 

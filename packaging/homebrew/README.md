@@ -12,7 +12,8 @@ scripts/
   brew-release.sh       # generates the formula
   brew-cask-release.sh  # generates the cask from release archives
 .github/workflows/
-  release.yml           # builds arm64/x86_64 archives for every v* tag
+   release.yml           # builds arm64/x86_64 archives for every v* tag
+   homebrew.yml          # synchronizes the tap with GitHub's latest release
 ```
 
 ## How the cask works
@@ -27,6 +28,37 @@ formula installs the same plugin through CMake.
 The source repository and its release assets must be publicly downloadable for
 public Homebrew installs. The tap repository must also exist at
 `Ovicorps/homebrew-ovi-code`.
+
+## Automatic latest-release updates
+
+After release assets are published, the Release workflow calls **Update Homebrew
+tap**. It resolves GitHub's `/releases/latest` endpoint (excluding drafts and
+prereleases), generates both the cask and source formula with SHA-256 checksums,
+and commits them directly to `Ovicorps/homebrew-ovi-code`. Dependency resource
+versions come from the released tag, not unreleased changes on `main`.
+
+The same workflow runs on published/edited release events, hourly as a recovery
+check, and manually through **Actions → Update Homebrew tap → Run workflow**.
+GitHub's default workflow token cannot trigger a second workflow through a release
+event, so the explicit call from Release ensures immediate synchronization.
+Updates are serialized, unchanged files produce no commit, and a final latest-tag
+check prevents a stale release from overwriting a newer one.
+
+### Required one-time configuration
+
+1. Create and initialize the public `Ovicorps/homebrew-ovi-code` repository with
+   a default branch.
+2. Create a fine-grained GitHub token scoped to that repository with **Contents:
+   read and write** permission. The token owner must have write access; approve
+   organization access if required. Its permissions must allow pushes to the
+   tap's default branch, including any branch-protection requirements.
+3. Store the token in this source repository's Actions secret
+   **`HOMEBREW_TAP_TOKEN`**. The normal `GITHUB_TOKEN` cannot write to another repo.
+4. Run **Update Homebrew tap** once to synchronize the existing latest release.
+
+Missing credentials or release archives fail the workflow rather than publishing
+a cask with missing checksums. Keep the secret valid to maintain synchronization.
+The manual steps below remain available as a fallback.
 
 ## How the formula builds offline
 
@@ -98,13 +130,25 @@ mkdir -p homebrew-ovi-code/Casks
 
 ```bash
 brew tap Ovicorps/ovi-code        # adds the Ovicorps/homebrew-ovi-code tap
+brew update
 brew install --cask ovi-code
 ```
 
 Or in one shot without a separate tap step:
 
 ```bash
+brew update
 brew install --cask Ovicorps/ovi-code/ovi-code
+```
+
+Homebrew installs the version in its local tap metadata, so `brew update` is
+necessary to guarantee fresh metadata when auto-updates are disabled or cached.
+The tap is updated after publication; wait for **Update Homebrew tap** to finish.
+For an already installed copy, use:
+
+```bash
+brew update
+brew upgrade --cask Ovicorps/ovi-code/ovi-code
 ```
 
 Build the latest `main` branch from source:

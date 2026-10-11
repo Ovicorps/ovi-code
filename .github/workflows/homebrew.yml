@@ -1,0 +1,92 @@
+name: Update Homebrew tap
+
+on:
+  workflow_call:
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: true
+  workflow_dispatch:
+  release:
+    types: [published, edited]
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-tap
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tap credentials
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "Set HOMEBREW_TAP_TOKEN with Contents read/write access to Ovicorps/homebrew-ovi-code." >&2
+            exit 1
+          fi
+
+      - name: Resolve latest stable GitHub release
+        id: latest
+        run: |
+          tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Unsupported release tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out released source for dependency versions
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.latest.outputs.tag }}
+          path: released-source
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: Ovicorps/homebrew-ovi-code
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Generate versioned cask and formula with verified checksums
+        env:
+          RELEASE_TAG: ${{ steps.latest.outputs.tag }}
+          OVI_CODE_RELEASE_SOURCE_DIR: ${{ github.workspace }}/released-source
+        run: |
+          bash scripts/brew-cask-release.sh "$RELEASE_TAG" homebrew-tap/Casks/ovi-code.rb
+          bash scripts/brew-release.sh "$RELEASE_TAG" homebrew-tap/Formula/ovi-code.rb
+          ruby -c homebrew-tap/Casks/ovi-code.rb
+          ruby -c homebrew-tap/Formula/ovi-code.rb
+          if grep -q 'REPLACE_WITH_' homebrew-tap/{Casks,Formula}/ovi-code.rb; then
+            echo "Unresolved Homebrew template placeholders" >&2
+            exit 1
+          fi
+
+      - name: Publish tap update
+        env:
+          RELEASE_TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [ "$latest" != "$RELEASE_TAG" ]; then
+            echo "A newer release appeared; refusing to publish an outdated tap." >&2
+            exit 1
+          fi
+          git -C homebrew-tap config user.name "github-actions[bot]"
+          git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C homebrew-tap add Casks/ovi-code.rb Formula/ovi-code.rb
+          if git -C homebrew-tap diff --cached --quiet; then
+            echo "Homebrew already points to $RELEASE_TAG."
+            exit 0
+          fi
+          git -C homebrew-tap commit -m "Update ovi-code to $RELEASE_TAG"
+          git -C homebrew-tap push

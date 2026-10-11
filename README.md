@@ -60,8 +60,13 @@ system libcurl, Git, and an internet connection during the first configure.
 Install the prebuilt macOS cask after the Ovicorps tap has been published:
 
 ```bash
+brew update
 brew install --cask Ovicorps/ovi-code/ovi-code
 ```
+
+The Homebrew tap is synchronized automatically with GitHub's latest stable
+release. Run `brew update` before installing to refresh cached tap metadata.
+For an existing installation, use `brew upgrade --cask Ovicorps/ovi-code/ovi-code`.
 
 Alternatively, build from source:
 

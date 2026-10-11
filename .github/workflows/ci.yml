@@ -5,6 +5,13 @@ on:
   pull_request:
 
 jobs:
+  homebrew-packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Homebrew release generation without network access
+        run: python3 tests/test_homebrew_release.py
+
   build-test:
     strategy:
       matrix:

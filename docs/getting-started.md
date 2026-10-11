@@ -17,8 +17,13 @@ Building from source additionally requires:
 === "Homebrew"
 
     ```bash
+    brew update
     brew install --cask Ovicorps/ovi-code/ovi-code
     ```
+
+    The tap tracks GitHub's latest stable release. `brew update` refreshes cached
+    metadata; upgrade an existing installation with
+    `brew upgrade --cask Ovicorps/ovi-code/ovi-code`.
 
 === "Build from source"
 
