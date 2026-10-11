@@ -32,6 +32,7 @@ TUI.
 - Provider-specific model pickers with capability-aware reasoning effort and
   support for custom model IDs.
 - Visible model responses, tool calls, tool results, and file diffs.
+- Automatically saved sessions, including unfinished prompts, with workspace-specific resume.
 - Workspace-sandboxed file tools.
 - Standard ReAct, Chain of Thought, Ralph Loop, and RAG techniques.
 - Runtime-loaded C++ modules for user-defined agentic techniques, including a
@@ -161,8 +162,23 @@ changes into version control.
 4. Tool results are returned to the model until it produces a final response or
    reaches the configured tool-iteration limit.
 
-The conversation remains in memory for the current session. Restart OVI-CODE
-to begin a new conversation.
+Prompts, responses, tool activity, model context, and unfinished input are saved
+automatically. Reopen OVI-CODE in the same workspace to resume the latest session.
+
+### Saved Sessions
+
+```bash
+ovi-code                       # Resume the latest session in this workspace
+ovi-code --new-session         # Start fresh without deleting earlier sessions
+ovi-code sessions              # List saved session IDs, newest first
+ovi-code --resume <id>         # Reopen a specific session
+```
+
+An interrupted turn restores its prompt unless a newer draft exists. Nothing
+is sent and no tools are rerun until you submit a prompt. File changes made
+before the interruption may already be present; review them before continuing.
+If the provider or model has changed, the transcript is restored but model
+context starts fresh.
 
 ## Using The TUI
 
@@ -233,8 +249,11 @@ After pressing `Ctrl+W`, the output panel accepts these commands:
 
 ### Settings
 
-Press `s` from Normal mode to open Settings. Settings changes are applied to
-the next agent turn and saved when the application exits.
+Press `s` from Normal mode to open Settings. **Save changes** writes settings
+immediately and applies them to the next agent turn. The active config file is
+reloaded before opening Settings and before each turn, so file-edited API keys
+take effect without restarting. Saving preserves externally changed fields
+you did not edit in Settings; explicitly edited fields take precedence.
 
 Settings include:
 
@@ -249,13 +268,24 @@ Settings include:
 - Options declared by installed plugins.
 - Built-in editors for `tools.md` and `skills.md`.
 
+The API key field starts hidden and has a **Show key** radio control plus
+**Copy**, **Paste**, and **Clear** buttons. Focus **Show key** with Tab or arrows
+and press `Enter` to toggle between `( )` hidden and `(*)` visible.
+Paste replaces the entire key and removes surrounding
+whitespace, matching quotes, and an optional `Bearer ` prefix. Malformed pastes
+leave the current key unchanged. Focus the field and press `i`/`a` to select it
+for replacement, `Ctrl+A` to select all, `Ctrl+C` to copy, or `Ctrl+V` to paste.
+Copy places the secret on the system clipboard; visibility
+is reset when Settings closes or the provider changes. Clipboard buttons use
+native macOS APIs or optional `wl-clipboard`/`xclip` utilities on Linux.
+
 Settings uses the same modal navigation style:
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` or arrows | Change the focused list selection |
 | `Tab` | Move between controls; cycles a focused list |
-| `Enter` | Activate the focused button |
+| `Enter` | Activate the focused control |
 | `i` / `a` | Edit the focused text field |
 | `Esc` | Return to Normal mode or close Settings |
 | `q` | Close Settings from Normal mode |
@@ -488,6 +518,7 @@ ovi-code [command] [options]
 | --- | --- |
 | `init` | Run setup, save the configuration, and exit |
 | `plugins` | List loaded runtime technique plugins and loader errors |
+| `sessions` | List saved sessions for the selected workspace |
 | `uninstall` | Remove the saved configuration and exit |
 
 ### Options
@@ -503,6 +534,8 @@ ovi-code [command] [options]
 | `--list-plugins` | Alias for the `plugins` command |
 | `--uninstall` | Alias for the `uninstall` command |
 | `--no-splash` | Skip the startup splash screen |
+| `--new-session` | Start a new conversation while keeping earlier sessions |
+| `--resume <id>` | Resume a specific saved session; default is the latest |
 | `-h`, `--help` | Display command-line help |
 
 ### Environment
@@ -540,9 +573,18 @@ the saved key and model for each provider account and is restricted to the
 current user with mode `0600`. Environment-provided keys are not persisted. Use
 `--config` to choose another location.
 
-Chat history is not persisted to disk. The `c` command clears only the visible
-transcript; it does not remove the current conversation context sent to the
-model. Restart the application to begin with empty context.
+Sessions are saved locally under `~/.ovi-code/sessions/`, grouped by canonical
+workspace path. With `--config`, the `sessions/` directory is beside the selected
+config file. Directories use mode `0700`; checkpoint and draft files use `0600`.
+Saves are atomic and each session permits only one active writer.
+
+Session files are **not encrypted**: prompts, responses, provider reasoning
+state, and tool results can contain sensitive code or secrets. Provider account
+keys are not copied into session metadata. Visible transcript limits and model
+context compaction still apply; this is recovery storage, not an unlimited archive.
+The `c` command clears the saved visible transcript, not model context. Use
+`--new-session` to start with empty context. Neither that option nor `uninstall`
+deletes earlier sessions; remove saved session files explicitly if desired.
 
 Requests, assembled project instructions, and file contents returned by tools
 are sent to the selected provider. OpenRouter requests may also be handled by
@@ -630,6 +672,12 @@ make run ARGS="--workspace /path/to/project"
 CMake downloads FTXUI and nlohmann/json during the first configure and links
 against system libcurl. The installed executable is placed in the selected
 prefix's `bin` directory.
+
+On macOS, system libcurl is selected from the active SDK (or the SDK specified
+with `CMAKE_OSX_SYSROOT`) so cached Command Line Tools paths do not conflict with
+an Xcode linker. If a build reports a TAPI unknown-architecture error,
+reconfigure it or follow the
+[macOS build troubleshooting guide](https://ovicorps.github.io/ovi-code/troubleshooting/#macos-build-fails-with-a-tapi-unknown-architecture-error).
 
 Build, preview, or deploy the documentation with:
 

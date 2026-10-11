@@ -1,10 +1,15 @@
 #include "ovicode/config.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <system_error>
+#include <utility>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <nlohmann/json.hpp>
 
@@ -506,7 +511,12 @@ std::optional<Config> loadConfig(const fs::path& path) {
 
 bool saveConfig(const Config& cfg, const fs::path& path) {
     std::error_code ec;
-    fs::create_directories(path.parent_path(), ec);
+    const fs::path absolute = fs::absolute(path, ec);
+    if (ec) return false;
+    const fs::path target = fs::weakly_canonical(absolute, ec);
+    if (ec) return false;
+    fs::create_directories(target.parent_path(), ec);
+    if (ec) return false;
     json j = {
         {"version", 2},
         {"provider", providerToString(cfg.provider)},
@@ -542,13 +552,126 @@ bool saveConfig(const Config& cfg, const fs::path& path) {
         {"temperature", cfg.temperature},
         {"plugin_parameters", cfg.plugin_parameters},
     };
-    std::ofstream f(path);
-    if (!f) return false;
-    f << j.dump(2);
-    f.close();
-    fs::permissions(path,
-                    fs::perms::owner_read | fs::perms::owner_write,
-                    fs::perm_options::replace, ec);
+    const std::string contents = j.dump(2);
+    std::string pattern = target.string() + ".tmp.XXXXXX";
+    std::vector<char> filename(pattern.begin(), pattern.end());
+    filename.push_back('\0');
+    const int fd = ::mkstemp(filename.data());
+    if (fd < 0) return false;
+    struct TemporaryFile {
+        int fd;
+        fs::path path;
+        ~TemporaryFile() {
+            if (fd >= 0) ::close(fd);
+            std::error_code error;
+            fs::remove(path, error);
+        }
+    } temporary{fd, filename.data()};
+    if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) return false;
+    std::size_t written = 0;
+    while (written < contents.size()) {
+        const ssize_t count =
+            ::write(fd, contents.data() + written, contents.size() - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        written += static_cast<std::size_t>(count);
+    }
+    if (::fsync(fd) != 0) return false;
+    const int close_result = ::close(fd);
+    temporary.fd = -1;
+    if (close_result != 0) return false;
+    fs::rename(temporary.path, target, ec);
+    return !ec;
+}
+
+namespace {
+
+Config mergeConfigChanges(const Config& baseline, const Config& edited,
+                          Config latest) {
+    auto merge = [&]<typename T>(T Config::*field) {
+        if (edited.*field != baseline.*field) latest.*field = edited.*field;
+    };
+    merge(&Config::provider);
+    for (const auto& info : knownProviders()) {
+        const auto& before = providerAccount(baseline, info.provider);
+        const auto& after = providerAccount(edited, info.provider);
+        auto& account = providerAccount(latest, info.provider);
+        if (after.api_key != before.api_key) account.api_key = after.api_key;
+        if (after.model != before.model) account.model = after.model;
+    }
+    if (edited.technique != baseline.technique ||
+        edited.technique_id != baseline.technique_id) {
+        latest.technique = edited.technique;
+        latest.technique_id = edited.technique_id;
+    }
+    merge(&Config::theme);
+    merge(&Config::reasoning_effort);
+    merge(&Config::max_tool_iterations);
+    merge(&Config::ralph_iterations);
+    merge(&Config::plugin_iterations);
+    merge(&Config::max_tokens);
+    merge(&Config::max_context_bytes);
+    merge(&Config::max_request_bytes);
+    merge(&Config::temperature);
+    for (const auto& [id, values] : baseline.plugin_parameters) {
+        const auto edited_plugin = edited.plugin_parameters.find(id);
+        auto latest_plugin = latest.plugin_parameters.find(id);
+        if (latest_plugin == latest.plugin_parameters.end()) continue;
+        for (const auto& [key, value] : values) {
+            (void)value;
+            if (edited_plugin == edited.plugin_parameters.end() ||
+                !edited_plugin->second.contains(key)) {
+                latest_plugin->second.erase(key);
+            }
+        }
+        if (latest_plugin->second.empty()) {
+            latest.plugin_parameters.erase(latest_plugin);
+        }
+    }
+    for (const auto& [id, values] : edited.plugin_parameters) {
+        const auto before = baseline.plugin_parameters.find(id);
+        for (const auto& [key, value] : values) {
+            if (before == baseline.plugin_parameters.end() ||
+                !before->second.contains(key) ||
+                before->second.at(key) != value) {
+                latest.plugin_parameters[id][key] = value;
+            }
+        }
+    }
+    return latest;
+}
+
+}  // namespace
+
+ConfigFileSync::ConfigFileSync(fs::path path, const Config& initial)
+    : path_(std::move(path)), baseline_(initial) {}
+
+bool ConfigFileSync::reload(Config& config) {
+    const auto latest = loadConfig(path_);
+    if (!latest) return false;
+    config = mergeConfigChanges(baseline_, config, *latest);
+    baseline_ = *latest;
+    return true;
+}
+
+bool ConfigFileSync::save(Config& config) {
+    std::error_code error;
+    const bool exists = fs::exists(path_, error);
+    if (error) return false;
+    const auto latest = exists ? loadConfig(path_) : std::nullopt;
+    // Do not replace an unreadable or partially edited file with stale state.
+    if (exists && !latest) return false;
+    Config merged = latest ? mergeConfigChanges(baseline_, config, *latest)
+                           : config;
+    if (!latest || merged != *latest) {
+        if (!saveConfig(merged, path_)) return false;
+    } else {
+        fs::permissions(path_, fs::perms::owner_read | fs::perms::owner_write,
+                        fs::perm_options::replace, error);
+        if (error) return false;
+    }
+    config = std::move(merged);
+    baseline_ = config;
     return true;
 }
 

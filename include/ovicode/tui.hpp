@@ -4,6 +4,7 @@
 
 #include "ovicode/config.hpp"
 #include "ovicode/plugins.hpp"
+#include "ovicode/session.hpp"
 
 namespace ovicode {
 
@@ -14,6 +15,7 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins);
 // here as an in-screen modal overlay (see makeSettingsPanel in tui.cpp).
 void runChatScreen(Config& cfg, const std::filesystem::path& workspace,
                    const std::filesystem::path& agent_config_dir,
-                   const TechniquePluginRegistry& plugins);
+                    const TechniquePluginRegistry& plugins,
+                    ConfigFileSync& config_file, SessionStore& session);
 
 }  // namespace ovicode

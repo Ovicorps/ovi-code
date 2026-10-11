@@ -17,6 +17,7 @@
 #include "ovicode/config.hpp"
 #include "ovicode/metrics.hpp"
 #include "ovicode/plugins.hpp"
+#include "ovicode/session.hpp"
 #include "ovicode/tui.hpp"
 
 namespace {
@@ -27,6 +28,7 @@ enum class Command {
     Run,
     Init,
     Plugins,
+    Sessions,
     Uninstall,
 };
 
@@ -39,6 +41,8 @@ struct Args {
     bool show_help = false;
     bool reconfigure = false;
     bool show_splash = true;
+    bool new_session = false;
+    std::string resume_id;
 };
 
 bool stdoutIsTty() { return isatty(STDOUT_FILENO) != 0; }
@@ -88,6 +92,7 @@ void printHelp() {
         "Commands:\n"
         "  init                       Run setup, save config, and exit\n"
         "  plugins                    List runtime technique plugins\n"
+        "  sessions                   List saved sessions for this workspace\n"
         "  uninstall                  Remove saved config and exit\n"
         "\n"
         "Options:\n"
@@ -103,6 +108,9 @@ void printHelp() {
         "  --list-plugins             Alias for the plugins command\n"
         "  --uninstall                Alias for the uninstall command\n"
         "  --no-splash                Skip the ASCII splash screen\n"
+        "  --new-session              Start fresh; keep earlier saved sessions\n"
+        "  --resume <id>              Resume a saved session for this workspace\n"
+        "                             (default: resume the latest session)\n"
         "  -h, --help                 Show this help\n"
         "\n"
         "Environment overrides:\n"
@@ -158,6 +166,8 @@ Args parseArgs(int argc, char** argv) {
             selectCommand(Command::Init, s);
         } else if (s == "plugins" || s == "--list-plugins") {
             selectCommand(Command::Plugins, s);
+        } else if (s == "sessions") {
+            selectCommand(Command::Sessions, s);
         } else if (s == "uninstall" || s == "--uninstall") {
             selectCommand(Command::Uninstall, s);
         } else if (s == "--workspace") {
@@ -172,11 +182,19 @@ Args parseArgs(int argc, char** argv) {
             a.reconfigure = true;
         } else if (s == "--no-splash") {
             a.show_splash = false;
+        } else if (s == "--new-session") {
+            a.new_session = true;
+        } else if (s == "--resume") {
+            a.resume_id = take("--resume");
         } else {
             std::cerr << "Unknown argument: " << s << "\n";
             printHelp();
             std::exit(2);
         }
+    }
+    if (a.new_session && !a.resume_id.empty()) {
+        std::cerr << "Use either --new-session or --resume, not both.\n";
+        std::exit(2);
     }
     if (a.agent_config_dir.empty()) a.agent_config_dir = a.workspace;
     if (a.plugin_dir.empty()) {
@@ -284,6 +302,23 @@ int main(int argc, char** argv) {
     if (args.command == Command::Uninstall) {
         return uninstallConfig(args.config_path);
     }
+    const fs::path session_directory =
+        fs::absolute(args.config_path).parent_path() / "sessions";
+    if (args.command == Command::Sessions) {
+        try {
+            const auto sessions =
+                ovicode::SessionStore::list(session_directory, args.workspace);
+            std::cout << "Saved sessions for " << args.workspace << " (newest first):\n";
+            for (const auto& session : sessions)
+                std::cout << "  " << session.id << "\t" << session.model
+                          << "\t" << session.title << "\n";
+            if (sessions.empty()) std::cout << "  (no saved sessions)\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "Cannot list sessions: " << error.what() << "\n";
+            return 1;
+        }
+    }
 
     if (args.command == Command::Run && args.show_splash && stdoutIsTty()) {
         printSplash();
@@ -359,9 +394,23 @@ int main(int argc, char** argv) {
         ovicode::selectedModel(cfg) = ovicode::defaultModel(cfg.provider);
     }
 
-    ovicode::runChatScreen(cfg, args.workspace, args.agent_config_dir, plugins);
+    ovicode::ConfigFileSync config_file(args.config_path, cfg);
+    try {
+        ovicode::SessionStore session(session_directory, args.workspace, cfg,
+                                      args.new_session, args.resume_id);
+        ovicode::runChatScreen(cfg, args.workspace, args.agent_config_dir, plugins,
+                              config_file, session);
+    } catch (const std::exception& error) {
+        std::cerr << "Cannot open chat session: " << error.what()
+                  << "\nSaved files were not removed. Use --new-session to start fresh.\n";
+        return 1;
+    }
 
-    // Persist any settings changed during the session.
-    ovicode::saveConfig(cfg, args.config_path);
+    // Preserve file edits made during the session when saving local changes.
+    if (!config_file.save(cfg)) {
+        std::cerr << "Failed to save config to " << args.config_path
+                  << "; check the file's JSON and permissions.\n";
+        return 1;
+    }
     return 0;
 }

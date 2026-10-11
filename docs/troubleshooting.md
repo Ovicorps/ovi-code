@@ -10,6 +10,28 @@ OpenRouter keys must begin with `sk-or-v1-`. To rerun setup:
 ovi-code --setup
 ```
 
+### OpenRouter 401: User not found
+
+OpenRouter rejected the key used by the request. Create or verify your key at
+[OpenRouter API Keys](https://openrouter.ai/settings/keys), then update it in
+**Settings → Model** or the active config file. In the current format, the field
+is `accounts.openrouter.api_key`, not a legacy top-level `api_key` or
+`openrouter_api_key` field.
+
+Settings saves immediately. File edits are reloaded before opening Settings or
+starting the next turn. If you use `--config`, edit that file rather than the
+default `~/.ovi-code/config.json`.
+
+`OPENROUTER_API_KEY` still overrides the saved key. To use only the config key
+for a run:
+
+```bash
+env -u OPENROUTER_API_KEY ovi-code
+```
+
+Never share your API key in logs or bug reports. A malformed or unreadable
+config file blocks reloading; fix its JSON or permissions before retrying.
+
 ## The wrong project is open
 
 Quit and restart with an explicit workspace:
@@ -68,6 +90,46 @@ ovi-code plugins --plugin-dir /path/to/plugins
 Check the reported loader errors, platform extension (`.dylib` on macOS or
 `.so` on Linux), exported symbol, ABI version, and plugin ID. Restart OVI-CODE
 after rebuilding the module.
+
+## macOS build fails with a TAPI unknown architecture error
+
+An error mentioning `libcurl.tbd`, `malformed file`, or an unknown architecture
+such as `arm64e.x1-macos` can mean the build is mixing an SDK from one Xcode or
+Command Line Tools installation with another installation's linker. This is
+not an error in the application's C++ source.
+
+On macOS, CMake aligns system libcurl with the active SDK, or with the SDK
+selected through `CMAKE_OSX_SYSROOT`. Reconfigure an existing build to refresh
+stale SDK paths:
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+```
+
+If the error remains, check your active toolchain and SDK:
+
+```bash
+xcode-select -p
+xcrun --find clang++
+xcrun --find ld
+xcrun --show-sdk-path
+xcrun --show-sdk-version
+```
+
+Use a compatible, up-to-date Xcode or Command Line Tools installation. To test
+the active toolchain in a new build directory without deleting existing work:
+
+```bash
+cmake -S . -B build-macos \
+  -DCMAKE_CXX_COMPILER="$(xcrun --find clang++)" \
+  -DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)"
+cmake --build build-macos -j
+```
+
+Explicit custom curl installations remain supported. When using system curl,
+select its SDK with `CMAKE_OSX_SYSROOT` rather than pointing curl at a different
+SDK's `.tbd` file.
 
 ## Reset configuration
 

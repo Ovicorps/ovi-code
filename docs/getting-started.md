@@ -106,8 +106,10 @@ During a turn, the selected model may answer directly or request file tools.
 Tool activity is shown in the output panel and returned to the model until it
 answers or reaches the configured iteration limit.
 
-Conversation context stays in memory for the current process. Restart OVI-CODE
-to begin a new conversation.
+Conversation context, output, and unfinished prompts are saved automatically.
+Reopen OVI-CODE in the same workspace to resume. Use `--new-session` for an empty
+conversation, `ovi-code sessions` to list earlier sessions, or `--resume <id>` to
+reopen one. See [session recovery and privacy](user-guide.md#saved-sessions-and-recovery).
 
 ## Next steps
 

@@ -22,11 +22,14 @@
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/screen/screen.hpp>
+#include <ftxui/screen/terminal.hpp>
 
 #include <fcntl.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "ovicode/agent_md.hpp"
+#include "ovicode/api_key_input.hpp"
 #include "ovicode/metrics.hpp"
 #include "ovicode/providers.hpp"
 #include "ovicode/react.hpp"
@@ -361,9 +364,12 @@ void clearTerminal() {
 // navigation keys — the same invariant the chat screen relies on. `mode` is
 // owned by the caller so its renderer can show the active mode in the footer.
 Component vimModalLayer(Component child, ChatMode& mode,
-                        std::function<void()> on_cancel) {
+                        std::function<void()> on_cancel,
+                        std::function<bool(Event)> before_event = {}) {
     return CatchEvent(
-        child, [child, &mode, on_cancel = std::move(on_cancel)](Event e) {
+        child, [child, &mode, on_cancel = std::move(on_cancel),
+                before_event = std::move(before_event)](Event e) {
+            if (before_event && before_event(e)) return true;
             if (mode == ChatMode::Insert) {
                 if (e == Event::Escape) {
                     mode = ChatMode::Normal;
@@ -735,11 +741,34 @@ bool runSetupWizard(Config& cfg, const TechniquePluginRegistry& plugins) {
 
 namespace {
 
+struct BracketedPasteMode {
+    bool enabled = false;
+    bool restore_signals = false;
+    void set_enabled(bool value) {
+        if (enabled == value) return;
+        termios terminal;
+        if (::tcgetattr(STDIN_FILENO, &terminal) == 0) {
+            if (value) {
+                restore_signals = (terminal.c_lflag & ISIG) != 0;
+                terminal.c_lflag &= ~ISIG;
+            } else if (restore_signals) {
+                terminal.c_lflag |= ISIG;
+            }
+            ::tcsetattr(STDIN_FILENO, TCSANOW, &terminal);
+        }
+        enabled = value;
+        std::fputs(enabled ? "\x1b[?2004h" : "\x1b[?2004l", stdout);
+        std::fflush(stdout);
+    }
+    ~BracketedPasteMode() { set_enabled(false); }
+};
+
 struct PluginSettingField {
     std::string plugin_id;
     std::string plugin_label;
     PluginParameter parameter;
     std::string value;
+    std::string original_value;
     std::vector<std::string> choices;
     int choice_idx = 0;
     int choice_cursor_idx = 0;
@@ -764,10 +793,12 @@ struct SettingsState {
     Provider loaded_provider = Provider::OpenRouter;
     Provider effort_provider = Provider::OpenRouter;
     Config staged;
+    Config original;
     std::string api_key, model, max_iters_s, ralph_s, plugin_iters_s, temp_s;
     std::string context_kib_s, request_kib_s;
     std::string context_kib_original, request_kib_original;
     std::string effort_model;
+    std::string save_error;
     std::vector<ReasoningEffort> effort_options;
     std::vector<std::string> page_choices{
         "Model", "Agent", "Appearance", "Plugins", "Shortcuts"};
@@ -792,6 +823,7 @@ struct SettingsPanel {
 SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                                  ChatMode& mode,
                                  std::function<void(bool changed)> close,
+                                 std::function<bool(Config&)> persist,
                                  std::function<void()> edit_tools,
                                  std::function<void()> edit_skills,
                                  const TechniquePluginRegistry& plugins) {
@@ -839,9 +871,13 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
     };
     auto page_menu = Menu(&st->page_choices, &st->page_idx, page_option);
 
-    InputOption pw = paletteInputOption(cfg);
-    pw.password = true;
-    auto key_input = Input(&st->api_key, "API key", pw);
+    auto key_editor = makeApiKeyInput(st->api_key, paletteInputOption(cfg));
+    auto paste_mode = std::make_shared<BracketedPasteMode>();
+    auto close_form = [key_editor, paste_mode, close](bool changed) {
+        paste_mode->set_enabled(false);
+        key_editor.reset();
+        close(changed);
+    };
     auto iters_input =
         Input(&st->max_iters_s, "max tool iters", paletteInputOption(cfg));
     auto ralph_input = Input(&st->ralph_s, "ralph iterations",
@@ -925,13 +961,14 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
             account.model = defaultModel(st->loaded_provider);
         }
     };
-    auto load_provider_fields = [st, refresh_effort](
+    auto load_provider_fields = [st, refresh_effort, key_editor](
                                     Provider provider,
                                     ReasoningEffort selected_effort) {
         st->loaded_provider = provider;
         st->staged.provider = provider;
         const auto& account = providerAccount(st->staged, provider);
         st->api_key = account.api_key;
+        key_editor.reset();
         st->model = account.model.empty() ? defaultModel(provider) : account.model;
         st->model_choices = knownModels(provider);
         st->model_choices.push_back("(custom model ID)");
@@ -947,7 +984,9 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
     // and again by the caller each time the panel is reopened.
     auto sync = [st, &cfg, &plugins, load_provider_fields] {
         st->page_idx = 0;
+        st->save_error.clear();
         st->staged = cfg;
+        st->original = cfg;
         st->provider_idx = 0;
         const auto& providers = knownProviders();
         for (size_t i = 0; i < providers.size(); ++i) {
@@ -1000,6 +1039,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                     }
                 }
             }
+            field.original_value = field.value;
             if (field.parameter.type == PluginParameterType::Boolean) {
                 field.choice_idx = field.value == "true" ? 1 : 0;
             } else if (field.parameter.type == PluginParameterType::Choice) {
@@ -1017,8 +1057,24 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
     };
     sync();
 
-    auto save = [st, &cfg, close, current_provider, save_account_fields] {
+    auto save = [st, &cfg, close_form, persist, current_provider,
+                 save_account_fields] {
         save_account_fields();
+        for (const auto& info : knownProviders()) {
+            auto& account = providerAccount(st->staged, info.provider);
+            if (account.api_key ==
+                providerAccount(st->original, info.provider).api_key) {
+                continue;
+            }
+            const auto key = normalizeApiKeyInput(account.api_key);
+            if (!key) {
+                st->save_error = info.label +
+                    " API key is invalid: use one key without internal spaces, "
+                    "control characters, or unmatched quotes.";
+                return;
+            }
+            account.api_key = *key;
+        }
         st->staged.provider = current_provider();
         if (st->effort_idx >= 0 &&
             st->effort_idx < static_cast<int>(st->effort_options.size())) {
@@ -1068,16 +1124,24 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
             }
             auto normalized =
                 normalizePluginParameterValue(field.parameter, value);
-            st->staged.plugin_parameters[field.plugin_id][field.parameter.key] =
-                normalized ? std::move(*normalized)
-                           : field.parameter.default_value;
+            value = normalized ? std::move(*normalized)
+                               : field.parameter.default_value;
+            if (value != field.original_value) {
+                st->staged.plugin_parameters[field.plugin_id]
+                                            [field.parameter.key] = value;
+            }
+        }
+        if (!persist(st->staged)) {
+            st->save_error = "Could not save config. Check its JSON and "
+                             "permissions; changes were not applied.";
+            return;
         }
         cfg = st->staged;
-        close(true);
+        close_form(true);
     };
 
     auto save_button = Button("Save changes", save);
-    auto cancel_button = Button("Cancel", [close] { close(false); });
+    auto cancel_button = Button("Cancel", [close_form] { close_form(false); });
     auto tools_button = Button("Edit tools.md", std::move(edit_tools));
     auto skills_button = Button("Edit skills.md", std::move(edit_skills));
 
@@ -1086,7 +1150,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
         model_menu,
         custom_model_input,
         effort_menu,
-        key_input,
+        key_editor.component,
     });
     auto agent_page = Container::Vertical({
         technique_menu,
@@ -1113,6 +1177,8 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
 
     auto renderer = Renderer(layout, [=, &cfg, &screen, &mode] {
         const Palette& pal = palette(cfg.theme);
+        paste_mode->set_enabled(st->page_idx == 0 && key_editor.input->Focused());
+        if (st->page_idx != 0) key_editor.reset();
         ReasoningEffort selected = ReasoningEffort::Auto;
         if (st->effort_idx >= 0 &&
             st->effort_idx < static_cast<int>(st->effort_options.size())) {
@@ -1171,7 +1237,11 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
             model_fields.push_back(
                 text(providerLabel(provider) + " API key") | bold |
                     color(pal.accent));
-            model_fields.push_back(blockCursorInput(key_input));
+            model_fields.push_back(key_editor.component->Render());
+            model_fields.push_back(
+                paragraph("Keys start hidden. Paste replaces the entire key; "
+                          "press i/a to select it for editing. Enter finishes "
+                          "editing without saving.") | color(pal.muted));
             model_fields.push_back(
                 paragraph("Stored in your config with 0600 permissions. The "
                           + providerInfo(provider).environment_variable +
@@ -1307,6 +1377,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                    page_menu->Render() | center,
                    separator(),
                    body | yframe | flex,
+                   paragraph(st->save_error) | color(pal.error),
                    separator(),
                    hbox({
                        save_button->Render(),
@@ -1324,7 +1395,7 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                    text(mode == ChatMode::Insert
                               ? "INSERT · type · Esc → NORMAL"
                               : "NORMAL · j/k move · Space choose · "
-                                "Tab field/list · Enter button · i/a edit · "
+                                 "Tab field/list · Enter activate · i/a edit · "
                                 "q cancel") |
                        color(pal.muted) | center,
                }) |
@@ -1335,7 +1406,21 @@ SettingsPanel makeSettingsPanel(Config& cfg, ScreenInteractive& screen,
                      size(HEIGHT, LESS_THAN, max_h + 1));
     });
 
-    auto component = vimModalLayer(renderer, mode, [close] { close(false); });
+    auto key_events = [key_editor, &mode](Event event) {
+        if (key_editor.handle_special_event(event)) return true;
+        if (!key_editor.input->Focused()) return false;
+        if (mode == ChatMode::Normal &&
+            (event == Event::Character("i") || event == Event::Character("a"))) {
+            key_editor.begin_edit();
+        }
+        if (event == Event::Return) {
+            mode = ChatMode::Normal;
+            return true;
+        }
+        return mode == ChatMode::Normal && event == Event::Character(" ");
+    };
+    auto component = vimModalLayer(
+        renderer, mode, [close_form] { close_form(false); }, key_events);
     return SettingsPanel{component, sync};
 }
 
@@ -1972,7 +2057,8 @@ ConfigFileEditorPanel makeConfigFileEditorPanel(
 
 void runChatScreen(Config& cfg, const fs::path& workspace,
                    const fs::path& agent_config_dir,
-                   const TechniquePluginRegistry& plugins) {
+                   const TechniquePluginRegistry& plugins,
+                   ConfigFileSync& config_file, SessionStore& session) {
     std::error_code workspace_error;
     const fs::path workspace_root = fs::weakly_canonical(workspace,
                                                           workspace_error);
@@ -1983,16 +2069,22 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     const int workspace_fd = ::open(stable_workspace.c_str(),
                                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     ctx.workspace_fd = workspace_fd;
-    std::vector<Message> messages;
+    const SessionState saved_session = session.state();
+    std::vector<Message> messages = saved_session.messages;
 
     TranscriptStore transcript;
     TranscriptView transcript_view;
     std::atomic<bool> busy{false};
     std::atomic<bool> closing{false};
+    std::atomic<unsigned> session_save_failures{0};
     std::atomic<std::int64_t> custom_event_started_ns{0};
     std::jthread worker;
 
     VimEditor editor;
+    editor.setText(saved_session.draft);
+    editor.mode = ChatMode::Insert;
+    editor.row = static_cast<int>(editor.lines.size()) - 1;
+    editor.col = static_cast<int>(editor.lines.back().size());
     VimClipboard clipboard;
     // Ctrl+Tab toggles a single-line "minimized" view of the input panel so
     // the output area takes the whole screen while the prompt buffer is kept.
@@ -2012,6 +2104,30 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     // named constants, so build it from the raw control byte.
     const Event kCtrlW = Event::Special({23});
 
+    for (const auto& entry : saved_session.transcript) transcript.push(entry);
+    const bool restored = !saved_session.transcript.empty() ||
+                          !saved_session.messages.empty() ||
+                          !saved_session.draft.empty() ||
+                          !saved_session.pending_prompt.empty();
+    transcript.push({TranscriptEntry::Kind::System, "session",
+                     std::string(restored ? "Resumed session " : "Started session ") +
+                         saved_session.id + ". Prompts, responses, and drafts are "
+                         "saved automatically. Use --new-session to start fresh."});
+    if (!saved_session.pending_prompt.empty() || saved_session.turn_in_progress) {
+        transcript.push({TranscriptEntry::Kind::System, "recovery",
+                         "The previous turn did not complete. Its prompt is restored "
+                         "when no newer draft exists. No tools were automatically "
+                         "rerun; inspect any file changes before continuing."});
+    }
+    const bool incompatible_session =
+        saved_session.provider != providerToString(cfg.provider) ||
+        saved_session.model != selectedModel(cfg);
+    if (incompatible_session) {
+        messages.clear();
+        transcript.push({TranscriptEntry::Kind::System, "session",
+                         "Provider or model changed since this session was saved. "
+                         "The transcript is restored, but model context starts fresh."});
+    }
     transcript.push({TranscriptEntry::Kind::System, "welcome",
                      std::string("Workspace: ") + stable_workspace.string() +
                          "  ·  Provider: " + providerLabel(cfg.provider) +
@@ -2027,6 +2143,29 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             {TranscriptEntry::Kind::Error, "plugin loader", error});
     }
 
+    auto save_session = [&](auto&& save, bool draft = false) {
+        const unsigned failure_bit = draft ? 2U : 1U;
+        try {
+            save();
+            session_save_failures.fetch_and(~failure_bit);
+            return true;
+        } catch (const std::exception& error) {
+            if (!(session_save_failures.fetch_or(failure_bit) & failure_bit))
+                transcript.push({TranscriptEntry::Kind::Error, "session save",
+                                 "Could not save " + session.path().string() +
+                                     ": " + error.what() +
+                                     ". Recent work may not survive a close."});
+            return false;
+        }
+    };
+    if (incompatible_session)
+        save_session([&] { session.resetConversation(cfg, transcript.snapshot()); });
+    else
+        save_session([&] { session.saveTranscript(transcript.snapshot()); });
+    auto save_draft = [&] {
+        save_session([&] { session.saveDraft(editor.toString()); }, true);
+    };
+
     auto screen = ScreenInteractive::Fullscreen();
 
     // Settings render as a modal layered over the chat screen (ftxui::Modal)
@@ -2037,11 +2176,38 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     bool settings_open = false;
     int active_view = 0;  // chat/settings or exclusive file editor
     ChatMode settings_mode = ChatMode::Normal;
-    Provider provider_before_settings = cfg.provider;
-    std::string model_before_settings = selectedModel(cfg);
-    std::string key_before_settings =
-        providerAccount(cfg, cfg.provider).api_key;
-    ReasoningEffort effort_before_settings = cfg.reasoning_effort;
+    Config config_before_settings = cfg;
+    auto account_changed = [](const Config& before, const Config& after) {
+        return before.provider != after.provider ||
+               selectedModel(before) != selectedModel(after) ||
+               providerAccount(before, before.provider).api_key !=
+                   providerAccount(after, after.provider).api_key ||
+               before.reasoning_effort != after.reasoning_effort;
+    };
+    auto refresh_config = [&] {
+        const Config before = cfg;
+        if (!config_file.reload(cfg)) {
+            transcript.push(
+                {TranscriptEntry::Kind::Error, "configuration",
+                 "Cannot reload " + config_file.path().string() +
+                     "; check the file's JSON and permissions before retrying."});
+            return false;
+        }
+        if (account_changed(before, cfg)) {
+            messages.clear();
+            save_session([&] { session.resetConversation(cfg, transcript.snapshot()); });
+        }
+        return true;
+    };
+    auto persist_config = [&](Config& updated) {
+        if (config_file.save(updated)) return true;
+        transcript.push(
+            {TranscriptEntry::Kind::Error, "configuration",
+             "Cannot save " + config_file.path().string() +
+                 "; changes were not applied. Check the file's JSON and "
+                 "permissions."});
+        return false;
+    };
 
     // Hide the modal and, on Save, note the new config in the transcript. The
     // panel writes straight into `cfg`, so AgentContext picks it up on the next
@@ -2050,13 +2216,9 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         settings_open = false;
         settings_mode = ChatMode::Normal;
         if (changed) {
-            const bool account_changed =
-                provider_before_settings != cfg.provider ||
-                model_before_settings != selectedModel(cfg) ||
-                key_before_settings !=
-                    providerAccount(cfg, cfg.provider).api_key ||
-                effort_before_settings != cfg.reasoning_effort;
-            if (account_changed) messages.clear();
+            const bool changed_account =
+                account_changed(config_before_settings, cfg);
+            if (changed_account) messages.clear();
             transcript.push(
                 {TranscriptEntry::Kind::System, "settings",
                   std::string("Now using ") + providerLabel(cfg.provider) +
@@ -2065,10 +2227,14 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                           cfg.provider, selectedModel(cfg),
                           cfg.reasoning_effort)) + " effort / " +
                       selectedTechniqueLabel(cfg, plugins) +
-                      (account_changed
+                      (changed_account
                            ? ". Started a new conversation for this account "
                              "or model."
-                           : "")});
+                            : "")});
+            if (changed_account)
+                save_session([&] { session.resetConversation(cfg, transcript.snapshot()); });
+            else
+                save_session([&] { session.saveTranscript(transcript.snapshot()); });
         }
     };
     auto close_file_editor = [&](bool saved, const fs::path& path) {
@@ -2083,7 +2249,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
     auto file_editor =
         makeConfigFileEditorPanel(cfg, screen, clipboard, close_file_editor);
     auto settings = makeSettingsPanel(
-        cfg, screen, settings_mode, close_settings,
+        cfg, screen, settings_mode, close_settings, persist_config,
         [&] {
             file_editor.open(agent_config_dir / "tools.md");
             active_view = 1;
@@ -2094,14 +2260,24 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         }, plugins);
 
     auto send_turn = [&](std::string prompt) {
-        if (busy.exchange(true)) return;
+        if (busy.exchange(true)) return false;
         if (worker.joinable()) {
             metrics::ScopedTimer join_timer(
                 metrics::Distribution::TuiWorkerJoinUs);
             worker.join();
         }
+        if (!refresh_config()) {
+            busy.store(false);
+            return false;
+        }
         ctx.config = cfg;
         ctx.md = loadAgentMd(agent_config_dir);
+        if (!save_session([&] {
+                session.beginTurn(prompt, cfg, transcript.snapshot());
+            })) {
+            busy.store(false);
+            return false;
+        }
         worker = std::jthread(
             [&, prompt = std::move(prompt)](std::stop_token stop) mutable {
                 TurnOutcome outcome = TurnOutcome::Failed;
@@ -2113,6 +2289,9 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                                 return false;
                             }
                             transcript.push(entry);
+                            if (!save_session([&] {
+                                    session.checkpoint(messages, transcript.snapshot());
+                                })) return false;
                             if (!closing.load()) {
                                 const auto now_ns =
                                     std::chrono::duration_cast<
@@ -2151,6 +2330,11 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                     transcript.push({TranscriptEntry::Kind::System, "cancelled",
                                      "Turn cancelled."});
                 }
+                save_session([&] {
+                    session.finishTurn(messages, transcript.snapshot(),
+                                       outcome == TurnOutcome::Completed,
+                                       outcome == TurnOutcome::Cancelled);
+                });
                 busy.store(false);
                 if (!closing.load()) {
                     const auto now_ns =
@@ -2165,6 +2349,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                 }
             }
         );
+        return true;
     };
 
     auto cycle_technique = [&] {
@@ -2177,7 +2362,8 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         transcript.push(
             {TranscriptEntry::Kind::System, "technique",
              std::string("Switched to ") +
-                 selectedTechniqueLabel(cfg, plugins)});
+                  selectedTechniqueLabel(cfg, plugins)});
+        save_session([&] { session.saveTranscript(transcript.snapshot()); });
     };
     auto open_settings = [&] {
         if (busy.load()) {
@@ -2186,25 +2372,25 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
                  "Cannot open settings while a turn is in progress."});
             return;
         }
+        if (!refresh_config()) return;
         settings.sync();
-        provider_before_settings = cfg.provider;
-        model_before_settings = selectedModel(cfg);
-        key_before_settings = providerAccount(cfg, cfg.provider).api_key;
-        effort_before_settings = cfg.reasoning_effort;
+        config_before_settings = cfg;
         settings_mode = ChatMode::Normal;
         settings_open = true;
     };
     auto clear_transcript = [&] {
         transcript.clear();
         output_top_row = 0;
+        save_session([&] { session.saveTranscript(transcript.snapshot()); });
     };
 
     auto submit_buffer = [&] {
         if (busy.load() || editor.isEmpty()) return;
         auto p = editor.toString();
-        editor.clearBuffer();
-        editor.mode = ChatMode::Insert;
-        send_turn(p);
+        if (send_turn(std::move(p))) {
+            editor.clearBuffer();
+            editor.mode = ChatMode::Insert;
+        }
     };
     auto request_exit = [&] {
         closing.store(true);
@@ -2223,8 +2409,11 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         // Clear sink_value continuously so the hidden input never accumulates.
         sink_value.clear();
 
-        if (editor.mode == ChatMode::Insert)
-            return handleVimEditorEvent(editor, clipboard, e);
+        if (editor.mode == ChatMode::Insert) {
+            const bool handled = handleVimEditorEvent(editor, clipboard, e);
+            save_draft();
+            return handled;
+        }
 
         // ---- Normal mode ----
         // When control is on the output panel, j/k scroll it and the editing
@@ -2286,7 +2475,10 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             submit_buffer();
             return true;
         }
-        if (handleVimEditorEvent(editor, clipboard, e)) return true;
+        if (handleVimEditorEvent(editor, clipboard, e)) {
+            save_draft();
+            return true;
+        }
 
         // App commands (override the vim equivalents we don't implement)
         if (e == Event::Character("q")) {
@@ -2326,6 +2518,11 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             metrics::Distribution::TuiRenderBuildUs);
         metrics::add(metrics::Counter::TuiRenderBuilds);
         const Palette& pal = palette(cfg.theme);
+        // Screen dimensions and the reflected output box are not initialized
+        // on the first render. Recovered history must be visible immediately.
+        const auto terminal_size = Terminal::Size();
+        const int screen_width = screen.dimx() > 0 ? screen.dimx() : terminal_size.dimx;
+        const int screen_height = screen.dimy() > 0 ? screen.dimy() : terminal_size.dimy;
 
         // The chat editor paints its own block cursor (an `inverted` cell), and
         // the only FTXUI component in the tree is the hidden `sink` Input, which
@@ -2343,15 +2540,15 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             transcript_snapshot = std::move(*snapshot);
             rendered_generation = transcript_snapshot.generation;
         }
-        const int transcript_width = std::max(8, screen.dimx() - 6);
+        const int transcript_width = std::max(8, screen_width - 6);
         transcript_view.update(transcript_snapshot, transcript_width);
         const int measured_height = output_box.y_max >= output_box.y_min
                                         ? output_box.y_max - output_box.y_min + 1
                                         : 0;
         const int reserved_rows = input_minimized ? 7 : 13;
         output_view_height = static_cast<std::size_t>(std::max(
-            1, measured_height > 0 ? measured_height - 2
-                                   : screen.dimy() - reserved_rows));
+            1, measured_height > 2 ? measured_height - 2
+                                   : screen_height - reserved_rows));
         bool output_focused = (focus_target == FocusTarget::Output);
         const std::size_t max_top = transcript_view.totalRows() >
                                             output_view_height
@@ -2371,8 +2568,10 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         if (rendered.empty()) rendered.push_back(text(""));
         Element scroll = vbox(std::move(rendered));
 
-        std::string status = busy.load() ? " thinking… " : " ready ";
-        Color status_color = busy.load() ? pal.busy : pal.ready;
+        std::string status = session_save_failures.load() ? " NOT SAVED " :
+                             busy.load() ? " thinking… " : " ready ";
+        Color status_color = session_save_failures.load() ? pal.error :
+                             busy.load() ? pal.busy : pal.ready;
         bool insert = (editor.mode == ChatMode::Insert);
         std::string mode_tag = insert ? " -- INSERT -- " : " -- NORMAL -- ";
         Color mode_color = insert ? pal.insert_mode : pal.normal_mode;
@@ -2382,7 +2581,7 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
             reasoningEffortLabel(effectiveReasoningEffort(
                 cfg.provider, selectedModel(cfg), cfg.reasoning_effort)) +
             " effort · " + selectedTechniqueLabel(cfg, plugins);
-        const int header_summary_width = std::max(8, screen.dimx() - 38);
+        const int header_summary_width = std::max(8, screen_width - 38);
         Element header_content =
             hbox({
                 text("OVI-CODE") | bold | color(pal.accent),
@@ -2468,6 +2667,8 @@ void runChatScreen(Config& cfg, const fs::path& workspace,
         metrics::ScopedTimer join_timer(metrics::Distribution::TuiWorkerJoinUs);
         worker.join();
     }
+    save_draft();
+    save_session([&] { session.saveTranscript(transcript.snapshot()); });
     metrics::observe(
         metrics::Distribution::TuiShutdownUs,
         std::chrono::duration_cast<std::chrono::microseconds>(

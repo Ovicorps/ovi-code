@@ -3,9 +3,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <thread>
 #include <stop_token>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -16,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "ovicode/context.hpp"
+#include "ovicode/config.hpp"
 #include "ovicode/http.hpp"
 #include "ovicode/metrics.hpp"
 #include "ovicode/plugins.hpp"
@@ -62,6 +65,24 @@ void writeFile(const fs::path& path, const std::string& contents) {
     std::ofstream file(path, std::ios::binary);
     file << contents;
 }
+
+struct EnvironmentGuard {
+    std::string name;
+    std::optional<std::string> original;
+
+    explicit EnvironmentGuard(std::string variable) : name(std::move(variable)) {
+        if (const char* value = std::getenv(name.c_str())) original = value;
+        unsetenv(name.c_str());
+    }
+
+    ~EnvironmentGuard() {
+        if (original) {
+            setenv(name.c_str(), original->c_str(), 1);
+        } else {
+            unsetenv(name.c_str());
+        }
+    }
+};
 
 void testUtf8() {
     const std::string text =
@@ -255,6 +276,193 @@ void testConfigBounds() {
     CHECK(config.has_value());
     CHECK(config->max_context_bytes == 64 * 1024);
     CHECK(config->max_request_bytes == 128 * 1024 * 1024);
+}
+
+void testConfigSynchronization() {
+    TempDir directory;
+    const fs::path path = directory.path / "custom" / "settings.json";
+    Config live;
+    for (const auto& info : knownProviders()) {
+        providerAccount(live, info.provider).api_key = info.id + "-original";
+    }
+    live.plugin_parameters["review"]["depth"] = "brief";
+    CHECK(saveConfig(live, path));
+    ConfigFileSync sync(path, live);
+    CHECK(sync.path() == path);
+
+    Config disk = live;
+    for (const auto& info : knownProviders()) {
+        providerAccount(disk, info.provider).api_key = info.id + "-rotated";
+    }
+    const auto original_time = fs::last_write_time(path);
+    CHECK(saveConfig(disk, path));
+    fs::last_write_time(path, original_time);
+    CHECK(sync.reload(live));
+    CHECK(live == disk);
+
+    // An unchanged key in an already-open Settings form follows file edits.
+    Config staged = live;
+    staged.theme = Theme::Dark;
+    staged.openrouter.model = "custom/model";
+    staged.plugin_parameters["review"]["depth"] = "thorough";
+    disk.openrouter.api_key = "file-new-key";
+    disk.openai.api_key = "other-account-new-key";
+    disk.max_tokens = 12345;
+    disk.plugin_parameters["review"]["notes"] = "added outside Settings";
+    CHECK(saveConfig(disk, path));
+    CHECK(sync.save(staged));
+    CHECK(staged.openrouter.api_key == "file-new-key");
+    CHECK(staged.openai.api_key == "other-account-new-key");
+    CHECK(staged.openrouter.model == "custom/model");
+    CHECK(staged.theme == Theme::Dark);
+    CHECK(staged.max_tokens == 12345);
+    CHECK(staged.plugin_parameters["review"]["depth"] == "thorough");
+    CHECK(staged.plugin_parameters["review"]["notes"] ==
+          "added outside Settings");
+    CHECK(loadConfig(path) == staged);
+    live = staged;
+
+    // An explicitly edited Settings key wins when Save is pressed later.
+    staged = live;
+    staged.openrouter.api_key = "settings-new-key";
+    disk = live;
+    disk.openrouter.api_key = "concurrent-file-key";
+    disk.anthropic.api_key = "concurrent-other-account-key";
+    CHECK(saveConfig(disk, path));
+    CHECK(sync.save(staged));
+    CHECK(staged.openrouter.api_key == "settings-new-key");
+    CHECK(staged.anthropic.api_key == "concurrent-other-account-key");
+    CHECK(loadConfig(path) == staged);
+    live = staged;
+
+    staged = live;
+    staged.openrouter.api_key.clear();
+    CHECK(sync.save(staged));
+    CHECK(loadConfig(path)->openrouter.api_key.empty());
+    live = staged;
+
+    // Saving another setting on exit must not resurrect an old key.
+    live.technique_id = "review-plugin";
+    disk = staged;
+    disk.openrouter.api_key = "last-file-key";
+    disk.technique = Technique::Rag;
+    disk.technique_id = "rag";
+    CHECK(saveConfig(disk, path));
+    CHECK(sync.save(live));
+    CHECK(live.openrouter.api_key == "last-file-key");
+    CHECK(live.technique == Technique::Standard);
+    CHECK(live.technique_id == "review-plugin");
+    CHECK(loadConfig(path) == live);
+
+    const auto permissions = fs::status(path).permissions() & fs::perms::all;
+    CHECK(permissions == (fs::perms::owner_read | fs::perms::owner_write));
+    const auto saved_time = fs::last_write_time(path);
+    fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write |
+                              fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace);
+    CHECK(sync.save(live));
+    CHECK(fs::last_write_time(path) == saved_time);
+    CHECK((fs::status(path).permissions() & fs::perms::all) ==
+          (fs::perms::owner_read | fs::perms::owner_write));
+}
+
+void testConfigSynchronizationFailures() {
+    TempDir directory;
+    const fs::path path = directory.path / "config.json";
+    Config live;
+    live.openrouter.api_key = "original-key";
+    CHECK(saveConfig(live, path));
+    ConfigFileSync sync(path, live);
+    const Config original = live;
+    writeFile(path, "{unfinished JSON");
+    CHECK(!sync.reload(live));
+    CHECK(live == original);
+    Config staged = live;
+    staged.openrouter.api_key = "settings-key";
+    CHECK(!sync.save(staged));
+    CHECK(staged.openrouter.api_key == "settings-key");
+    std::ifstream file(path);
+    std::string contents;
+    std::getline(file, contents);
+    CHECK(contents == "{unfinished JSON");
+    CHECK(saveConfig(original, path));
+    CHECK(sync.save(staged));
+    CHECK(loadConfig(path)->openrouter.api_key == "settings-key");
+
+    fs::remove(path);
+    live = staged;
+    CHECK(!sync.reload(live));
+    CHECK(live == staged);
+    CHECK(sync.save(live));
+    CHECK(loadConfig(path) == staged);
+
+    const fs::path blocked = directory.path / "blocked";
+    fs::create_directory(blocked);
+    CHECK(!saveConfig(live, blocked));
+    CHECK(fs::is_directory(blocked));
+    for (const auto& entry : fs::directory_iterator(directory.path)) {
+        CHECK(entry.path().filename().string().find(".tmp.") ==
+              std::string::npos);
+    }
+}
+
+void testConfigLegacyAndSymlink() {
+    TempDir directory;
+    const fs::path path = directory.path / "legacy.json";
+    writeFile(path,
+              R"({"provider":"openrouter","openrouter_api_key":"legacy-old"})");
+    Config live = *loadConfig(path);
+    ConfigFileSync sync(path, live);
+    writeFile(path,
+              R"({"provider":"openrouter","openrouter_api_key":"legacy-new"})");
+    CHECK(sync.reload(live));
+    CHECK(live.openrouter.api_key == "legacy-new");
+    live.openrouter.api_key = "settings-migrated-key";
+    CHECK(sync.save(live));
+    CHECK(loadConfig(path)->openrouter.api_key == "settings-migrated-key");
+
+    const fs::path link = directory.path / "config-link.json";
+    fs::create_symlink(path, link);
+    live.openrouter.api_key = "symlink-key";
+    CHECK(saveConfig(live, link));
+    CHECK(fs::is_symlink(link));
+    CHECK(loadConfig(path) == live);
+    CHECK(loadConfig(link) == live);
+}
+
+void testConfigKeyUsedByTurn() {
+    EnvironmentGuard environment("OPENROUTER_API_KEY");
+    TempDir directory;
+    const fs::path path = directory.path / "config.json";
+    AgentContext context;
+    context.workspace = directory.path;
+    context.config.openrouter.api_key = "sk-or-v1-old-test-key";
+    CHECK(saveConfig(context.config, path));
+    ConfigFileSync sync(path, context.config);
+    Config disk = context.config;
+    disk.openrouter.api_key = "sk-or-v1-latest-test-key";
+    CHECK(saveConfig(disk, path));
+    CHECK(sync.reload(context.config));
+    int calls = 0;
+    context.chat_handler = [&calls](const Config& config, const ChatRequest&,
+                                    std::stop_token) {
+        ++calls;
+        CHECK(effectiveApiKey(config, Provider::OpenRouter) ==
+              "sk-or-v1-latest-test-key");
+        ChatResponse response;
+        response.text = "answer";
+        return response;
+    };
+    std::vector<Message> messages;
+    CHECK(runTurn(context, messages, "check latest key", {}) ==
+          TurnOutcome::Completed);
+    CHECK(calls == 1);
+
+    setenv("OPENROUTER_API_KEY", "sk-or-v1-environment-test-key", 1);
+    CHECK(effectiveApiKey(context.config, Provider::OpenRouter) ==
+          "sk-or-v1-environment-test-key");
+    CHECK(sync.save(context.config));
+    CHECK(loadConfig(path)->openrouter.api_key == "sk-or-v1-latest-test-key");
 }
 
 void testPluginParameters() {
@@ -452,6 +660,10 @@ int main() {
     testProviderSerialization();
     testTools();
     testConfigBounds();
+    testConfigSynchronization();
+    testConfigSynchronizationFailures();
+    testConfigLegacyAndSymlink();
+    testConfigKeyUsedByTurn();
     testPluginParameters();
     testHttpCancellation();
     testTurnOutcomes();

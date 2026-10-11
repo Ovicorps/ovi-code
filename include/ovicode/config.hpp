@@ -92,6 +92,8 @@ const std::string& defaultModel(Provider provider);
 struct ProviderAccount {
     std::string model;
     std::string api_key;
+
+    bool operator==(const ProviderAccount&) const = default;
 };
 
 struct Config {
@@ -113,6 +115,8 @@ struct Config {
     double temperature = 0.2;
     // plugin id -> parameter key -> serialized value
     std::map<std::string, std::map<std::string, std::string>> plugin_parameters;
+
+    bool operator==(const Config&) const = default;
 };
 
 ProviderAccount& providerAccount(Config& config, Provider provider);
@@ -126,6 +130,20 @@ std::filesystem::path defaultConfigDir();
 std::filesystem::path defaultConfigPath();
 std::optional<Config> loadConfig(const std::filesystem::path& path);
 bool saveConfig(const Config& cfg, const std::filesystem::path& path);
+
+// Merge edits against the last loaded/saved snapshot. Unchanged local fields
+// follow the file; explicitly edited fields take precedence on Save.
+class ConfigFileSync {
+public:
+    ConfigFileSync(std::filesystem::path path, const Config& initial);
+    const std::filesystem::path& path() const { return path_; }
+    bool reload(Config& config);
+    bool save(Config& config);
+
+private:
+    std::filesystem::path path_;
+    Config baseline_;
+};
 
 // If `path` doesn't exist but a config from the prior ~/.config/ovi-code/
 // location does, move it to `path` (creating parent dirs). Returns true if a

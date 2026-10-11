@@ -10,6 +10,7 @@ ovi-code [command] [options]
 | --- | --- |
 | `init` | Run setup, save configuration, and exit |
 | `plugins` | List runtime technique plugins and loader errors |
+| `sessions` | List saved sessions for the selected workspace, newest first |
 | `uninstall` | Remove the saved configuration and exit |
 
 ## Options
@@ -25,6 +26,8 @@ ovi-code [command] [options]
 | `--list-plugins` | Alias for `plugins` |
 | `--uninstall` | Alias for `uninstall` |
 | `--no-splash` | Skip the startup splash |
+| `--new-session` | Start fresh while retaining previous saved sessions |
+| `--resume <id>` | Resume a specific workspace session; default is the latest |
 | `-h`, `--help` | Print CLI and keyboard help |
 
 ## Environment variables
@@ -43,6 +46,7 @@ ovi-code [command] [options]
 | Path | Purpose |
 | --- | --- |
 | `~/.ovi-code/config.json` | Saved settings and provider accounts; mode `0600` |
+| `~/.ovi-code/sessions/` | Workspace-grouped recovery checkpoints and drafts; files `0600`, directories `0700` |
 | `~/.ovi-code/plugins/` | Default native technique plugin directory |
 | `<workspace>/agent.md` | Project persona, conventions, and constraints |
 | `<workspace>/tools.md` | Project-specific tool instructions |
@@ -50,6 +54,9 @@ ovi-code [command] [options]
 
 Use `--config`, `--plugin-dir`, or `--agent-config-dir` to override the relevant
 default path.
+With `--config`, session storage is in `sessions/` beside the selected config file.
+`sessions` does not require an API key. `--new-session` and `--resume` are mutually
+exclusive. Interrupted tools are never automatically replayed.
 
 ## Built-in tools
 

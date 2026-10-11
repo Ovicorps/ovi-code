@@ -66,3 +66,6 @@ markdown_extensions:
       permalink: true
 
 copyright: Copyright &copy; 2026 Ovicorps
+
+extra_css:
+  - stylesheets/extra.css
