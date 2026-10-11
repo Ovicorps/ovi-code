@@ -11,6 +11,9 @@ theme:
   name: material
   language: en
   logo: assets/OviCode.png
+  font:
+    text: DM Sans
+    code: DM Mono
   features:
     - content.code.copy
     - navigation.footer
