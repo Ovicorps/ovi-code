@@ -1,3 +1,5 @@
+![OVI-CODE logo](docs/assets/OviCode.png)
+
 # OVI-CODE
 
 OVI-CODE is a terminal-based coding agent written in C++20. It connects to

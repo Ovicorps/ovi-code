@@ -1,3 +1,5 @@
+![OVI-CODE logo](assets/OviCode.png)
+
 # OVI-CODE
 
 **A fast, keyboard-driven coding agent for your terminal.**
