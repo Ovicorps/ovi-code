@@ -1,12 +1,36 @@
 # Technique plugins
 
-Technique plugins are native C++ dynamic libraries loaded at process startup.
-They appear in setup, Settings, and the ++t++ technique cycle without linking
-against OVI-CODE internals.
+Technique plugins let you extend how OVI-CODE handles a task without forking or
+rebuilding the application. Each plugin is a native C++ dynamic library loaded
+at process startup through a versioned, dependency-free C ABI. It appears in
+setup, Settings, and the ++t++ technique cycle without linking against OVI-CODE
+internals.
+
+A plugin controls an agent turn while the host supplies the configured
+provider, the existing ReAct/tool loop, and the conversation transcript. You
+can start with a small prompt customization or build a multi-pass workflow
+with its own settings and stopping criteria.
 
 !!! danger "Plugins execute native code"
     A plugin has the same operating-system permissions as OVI-CODE. It is not
     sandboxed. Install only plugins whose source and publisher you trust.
+
+## What you can extend
+
+| Capability | How a plugin uses it | Example custom workflow |
+| --- | --- | --- |
+| Task instructions | Extend `host->base_system_prompt` before calling `host->run_react` | A code review guided by your team's conventions |
+| Turn orchestration | Run multiple ReAct passes and inspect `host->last_assistant_text` between them | An implementation pass followed by critique and refinement |
+| User-facing options | Declare typed V2 parameters and read them through `host->get_parameter` | Configurable review depth, extra instructions, or pass count |
+| Progress reporting | Write System or Error entries with `host->emit` | Explain which workflow stage is running |
+
+These are examples you can implement, not additional bundled techniques.
+Plugins reuse the selected provider and host workspace tools rather than
+requiring separate model-client or tool implementations.
+
+The current public ABI extends **agentic techniques**; it does not provide a
+registry for adding providers, workspace tools, or TUI panels. The workspace
+sandbox applies to the host's file tools, not to a plugin's own native code.
 
 ## Bundled example
 
@@ -46,6 +70,18 @@ ovi-code plugins
 
 OVI-CODE loads `.dylib` and `.so` files once at startup. Restart after adding or
 rebuilding a plugin.
+
+## Install and use a plugin
+
+1. Obtain or build a trusted plugin for your operating system and CPU
+   architecture. Put its `.dylib` or `.so` file in `~/.ovi-code/plugins`, creating
+   the directory if needed, or use a directory from the search list above.
+2. Run `ovi-code plugins` to check that the module loads and resolve any reported
+   errors.
+3. Start or restart OVI-CODE. Select the plugin during setup, under
+   **Settings → Agent**, or with ++t++ in chat Normal mode.
+4. If the plugin declares options, customize them under **Settings → Plugins**.
+   Values are saved per plugin and supplied to it during each turn.
 
 ## Build the bundled example
 
@@ -156,6 +192,29 @@ The host validates values and falls back to the declared default if a manually
 edited configuration contains an invalid value. Returned pointers remain valid
 until `run_turn` returns. Secret parameters are masked in Settings, but are
 stored in the same user-readable configuration file as provider keys.
+
+## Design a multi-pass workflow
+
+A technique can do more than prepend instructions. For a review-and-refine
+plugin, for example:
+
+1. Start with `host->base_system_prompt` to retain the project's instructions.
+2. Call `host->run_react` with the user's request and your implementation
+   instructions.
+3. Read `host->last_assistant_text`, then request another pass with review or
+   refinement instructions when needed.
+4. Stop when your completion criteria are met or the pass budget is exhausted.
+
+**Settings → Agent → Plugin passes** caps the number of host ReAct passes a
+plugin can request in one turn; `host->iteration_limit` exposes that budget.
+Each pass also uses the configured tool-call limit. Respect failed callback
+returns: `run_react` returns `0` on an error or cancellation, and `emit` returns
+`0` when the turn has been cancelled. Return control rather than continuing the
+workflow after either failure.
+
+Copy any assistant text you need to keep before the next `run_react` call,
+because that call can invalidate the pointer returned by
+`last_assistant_text`.
 
 ## Runtime interface
 
