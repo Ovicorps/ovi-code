@@ -184,6 +184,8 @@ include(GNUInstallDirs)
 install(TARGETS ovi-code RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES include/ovicode/technique_plugin.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ovicode)
+install(FILES LICENSE NOTICE
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/licenses/ovi-code)
 
 option(OVI_CODE_BUILD_EXAMPLE_PLUGINS "Build example technique plugins" ON)
 if(OVI_CODE_BUILD_EXAMPLE_PLUGINS)

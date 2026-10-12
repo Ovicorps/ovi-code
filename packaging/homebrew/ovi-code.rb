@@ -13,7 +13,7 @@ class OviCode < Formula
   homepage "https://github.com/Ovicorps/ovi-code"
   url "https://github.com/Ovicorps/ovi-code/archive/refs/tags/REPLACE_WITH_TAG.tar.gz"
   sha256 "REPLACE_WITH_SOURCE_TARBALL_SHA256"
-  license "MIT"
+  license "Apache-2.0"
   head "https://github.com/Ovicorps/ovi-code.git", branch: "main"
 
   livecheck do

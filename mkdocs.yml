@@ -46,6 +46,7 @@ nav:
   - Technique plugins: plugins.md
   - CLI reference: reference.md
   - Troubleshooting: troubleshooting.md
+  - License: license.md
 
 plugins:
   - search
@@ -59,13 +60,19 @@ markdown_extensions:
       anchor_linenums: true
   - pymdownx.keys
   - pymdownx.superfences
+  - pymdownx.snippets:
+      check_paths: true
+      base_path:
+        - .
   - pymdownx.tabbed:
       alternate_style: true
   - tables
   - toc:
       permalink: true
 
-copyright: Copyright &copy; 2026 Ovicorps
+copyright: >-
+  Copyright &copy; 2026 Ovicorps ·
+  Licensed under the <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License 2.0</a>
 
 extra_css:
   - stylesheets/extra.css

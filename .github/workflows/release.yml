@@ -80,8 +80,13 @@ jobs:
           cp stage/bin/ovi-code package/ovi-code
           cp stage/lib/ovi-code/plugins/* package/plugins/
           package/ovi-code plugins | grep -q deliberate
+          for notice in LICENSE NOTICE; do
+            if [ -f "$notice" ]; then
+              cp "$notice" package/
+            fi
+          done
           tar -C package -czf "ovi-code-darwin-${{ matrix.arch }}.tar.gz" \
-            ovi-code plugins
+            .
           shasum -a 256 "ovi-code-darwin-${{ matrix.arch }}.tar.gz" \
             > "ovi-code-darwin-${{ matrix.arch }}.tar.gz.sha256"
 

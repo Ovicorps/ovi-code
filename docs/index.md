@@ -100,3 +100,8 @@ then press ++enter++ to send it.
     OVI-CODE can make broad changes inside the selected workspace. Use version
     control, review diffs, and avoid opening directories that contain unrelated
     sensitive files.
+
+## License
+
+OVI-CODE's original source code and documentation are licensed under the
+[Apache License, Version 2.0](license.md). Copyright © 2026 Ovicorps.

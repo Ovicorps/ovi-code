@@ -23,6 +23,7 @@ TUI.
 - [Troubleshooting](#troubleshooting)
 - [Uninstall](#uninstall)
 - [Building From Source](#building-from-source)
+- [License](#license)
 
 ## Features
 
@@ -702,3 +703,11 @@ Release automation builds checksummed Apple Silicon and Intel archives for
 tagged versions. See
 [`packaging/homebrew/README.md`](packaging/homebrew/README.md) for cask and tap
 publishing instructions.
+
+## License
+
+Copyright © 2026 Ovicorps. OVI-CODE's original source code and documentation
+are licensed under the [Apache License, Version 2.0](LICENSE).
+See [NOTICE](NOTICE) for attribution and the
+[documentation license page](https://ovicorps.github.io/ovi-code/license/) for
+the full terms. Third-party dependencies and materials retain their own licenses.

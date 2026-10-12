@@ -56,6 +56,7 @@ FetchContent_Declare(ftxui
         result = self.generate("brew-release.sh", output)
         self.assertEqual(result.returncode, 0, result.stderr)
         formula = output.read_text()
+        self.assertIn('license "Apache-2.0"', formula)
         for url in (
             "https://github.com/Ovicorps/ovi-code/archive/refs/tags/v9.8.7.tar.gz",
             "https://github.com/nlohmann/json/archive/refs/tags/v3.99.0.tar.gz",
